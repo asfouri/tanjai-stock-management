@@ -9,4 +9,9 @@ export class AppController {
   getHello(): string {
     return this.appService.getHello();
   }
+
+  @Get('dashboard/summary')
+  getDashboardSummary() {
+    return this.appService.getDashboardSummary();
+  }
 }
