@@ -455,9 +455,9 @@ function Panel({
   children,
 }: Readonly<{ title: string; children: React.ReactNode }>) {
   return (
-    <section className="rounded-lg border border-zinc-200 bg-white p-5 shadow-sm">
+    <section className="min-w-0 rounded-lg border border-zinc-200 bg-white p-5 shadow-sm">
       <h2 className="text-base font-semibold">{title}</h2>
-      <div className="mt-5">{children}</div>
+      <div className="mt-5 min-w-0">{children}</div>
     </section>
   );
 }
@@ -815,7 +815,7 @@ export default function DashboardPage() {
   ];
 
   return (
-    <main className="min-h-screen bg-zinc-50 text-zinc-950">
+    <main className="min-h-screen overflow-x-hidden bg-zinc-50 text-zinc-950">
       <aside className="fixed inset-y-0 left-0 hidden w-64 flex-col border-r border-zinc-200 bg-white px-5 py-6 md:flex">
         <div className="text-lg font-semibold">TanjAI Stock</div>
         <nav className="mt-8 space-y-1" aria-label="Dashboard sections">
@@ -847,7 +847,7 @@ export default function DashboardPage() {
         </button>
       </aside>
 
-      <div className="md:pl-64">
+      <div className="min-w-0 md:pl-64">
         <header className="sticky top-0 z-10 border-b border-zinc-200 bg-white/95 px-5 py-4 backdrop-blur md:px-8">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div>
@@ -889,7 +889,7 @@ export default function DashboardPage() {
           </div>
         </header>
 
-        <section className="space-y-5 px-5 py-6 md:px-8">
+        <section className="min-w-0 space-y-5 px-5 py-6 md:px-8">
           {errorMessage ? (
             <div className="rounded-lg border border-red-200 bg-red-50 p-5 text-sm text-red-700">
               {errorMessage}
@@ -1487,26 +1487,26 @@ function ProductsSection({
       {visibleProducts.length === 0 ? (
         <EmptyState label="No products match your search." />
       ) : (
-        <div className="mt-5 overflow-x-auto">
-          <table className="w-full min-w-[980px] table-fixed text-left text-sm">
+        <div className="mt-5 w-full overflow-hidden">
+          <table className="w-full table-fixed text-left text-sm">
             <colgroup>
+              <col className="w-[7%]" />
+              <col className="w-[31%]" />
+              <col className="w-[35%]" />
               <col className="w-[8%]" />
-              <col className="w-[28%]" />
-              <col className="w-[30%]" />
-              <col className="w-[9%]" />
-              <col className="w-[9%]" />
-              <col className="w-[10%]" />
-              <col className="w-[6%]" />
+              <col className="w-[7%]" />
+              <col className="w-[7%]" />
+              <col className="w-[5%]" />
             </colgroup>
             <thead>
               <tr className="border-b border-zinc-200 text-xs uppercase tracking-wide text-zinc-500">
-                <th className="px-3 py-3 font-semibold">Image</th>
-                <th className="px-3 py-3 font-semibold">Product</th>
-                <th className="px-3 py-3 font-semibold">SKU aliases</th>
-                <th className="px-3 py-3 text-right font-semibold">Weight</th>
-                <th className="px-3 py-3 text-right font-semibold">Lines</th>
-                <th className="px-3 py-3 text-right font-semibold">Stock buys</th>
-                <th className="px-3 py-3 text-right font-semibold">Details</th>
+                <th className="px-2 py-3 font-semibold">Image</th>
+                <th className="px-2 py-3 font-semibold">Product</th>
+                <th className="px-2 py-3 font-semibold">SKU aliases</th>
+                <th className="px-2 py-3 text-right font-semibold">Weight</th>
+                <th className="px-2 py-3 text-right font-semibold">Lines</th>
+                <th className="px-2 py-3 text-right font-semibold">Buys</th>
+                <th className="px-2 py-3 text-right font-semibold">View</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-100">
@@ -1516,14 +1516,14 @@ function ProductsSection({
                   key={productRowKey(product) as string}
                   onClick={() => onSelectProduct(product)}
                 >
-                  <td className="px-3 py-3">
+                  <td className="px-2 py-3">
                     <ProductImage
                       alt={`${product.name || "Product"} image`}
                       size="small"
                       src={product.imageUrl}
                     />
                   </td>
-                  <td className="px-3 py-3">
+                  <td className="min-w-0 px-2 py-3">
                     <p className="line-clamp-2 font-medium text-zinc-900">
                       {product.name || "-"}
                     </p>
@@ -1531,21 +1531,21 @@ function ProductsSection({
                       {product.description || "No description"}
                     </p>
                   </td>
-                  <td className="px-3 py-3">
+                  <td className="min-w-0 px-2 py-3">
                     <SkuChips skus={product.skuAliases ?? []} />
                   </td>
-                  <td className="px-3 py-3 text-right tabular-nums text-zinc-700">
+                  <td className="px-2 py-3 text-right tabular-nums text-zinc-700">
                     {formatCellValue(product.weight)}
                   </td>
-                  <td className="px-3 py-3 text-right tabular-nums text-zinc-700">
+                  <td className="px-2 py-3 text-right tabular-nums text-zinc-700">
                     {formatNumber(product.orderLines ?? 0)}
                   </td>
-                  <td className="px-3 py-3 text-right tabular-nums text-zinc-700">
+                  <td className="px-2 py-3 text-right tabular-nums text-zinc-700">
                     {formatNumber(product.stockPurchases ?? 0)}
                   </td>
-                  <td className="px-3 py-3 text-right">
+                  <td className="px-2 py-3 text-right">
                     <button
-                      className="rounded-md border border-zinc-300 px-3 py-1.5 text-xs font-medium transition hover:bg-white"
+                      className="rounded-md border border-zinc-300 px-2 py-1.5 text-xs font-medium transition hover:bg-white"
                       type="button"
                       onClick={(event) => {
                         event.stopPropagation();
@@ -1600,10 +1600,10 @@ function SkuChips({ skus }: { skus: string[] }) {
   const remaining = visibleSkus.length - visible.length;
 
   return (
-    <div className="flex flex-wrap gap-1.5">
+    <div className="flex min-w-0 flex-wrap gap-1.5">
       {visible.map((sku) => (
         <span
-          className="max-w-[13rem] truncate rounded-full bg-zinc-100 px-2 py-1 text-xs font-medium text-zinc-700"
+          className="max-w-full truncate rounded-full bg-zinc-100 px-2 py-1 text-xs font-medium text-zinc-700"
           key={sku}
           title={sku}
         >
