@@ -4,6 +4,7 @@ import {
   Controller,
   Get,
   Headers,
+  Param,
   Post,
   Query,
   Req,
@@ -29,6 +30,11 @@ export class AppController {
     return this.appService.getDashboardSummary(filters);
   }
 
+  @Get('dashboard/section/:section')
+  getDashboardSection(@Param('section') section: string) {
+    return this.appService.getDashboardSection(section);
+  }
+
   @Post('imports/excel/preview')
   async previewExcelImport(
     @Req() request: IncomingMessage,
@@ -52,6 +58,24 @@ export class AppController {
   @Post('imports/excel/confirm')
   confirmExcelImport(@Body('token') token: string) {
     return this.excelImportService.confirm(token);
+  }
+
+  @Get('imports/excel/history')
+  listExcelImports() {
+    return this.excelImportService.listImportBatches();
+  }
+
+  @Post('imports/excel/remove')
+  removeExcelImport(@Body('importBatchId') importBatchId: string) {
+    return this.excelImportService.removeImportBatch(importBatchId);
+  }
+
+  @Post('imports/excel/replace')
+  replaceExcelImport(
+    @Body('importBatchId') importBatchId: string,
+    @Body('token') token: string,
+  ) {
+    return this.excelImportService.replaceImportBatch(importBatchId, token);
   }
 }
 

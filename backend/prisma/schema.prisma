@@ -68,6 +68,8 @@ model Product {
   name        String
   description String?
   weight      Float?
+  quotation   Json?
+  imageUrl    String?
   createdAt   DateTime @default(now())
 
   skuAliases         ProductSkuAlias[]
@@ -103,6 +105,7 @@ model Order {
   externalOrderNumber String
   orderDate           DateTime?
   invoiceReference    String
+  status              String    @default("CONFIRMED")
   sourceSheet         String
   sourceRow           Int
   createdAt           DateTime  @default(now())
@@ -129,6 +132,7 @@ model OrderLine {
   shippingCost Float  @default(0)
   handlingCost Float  @default(0)
   totalCost    Float  @default(0)
+  lineType     String @default("product")
   sourceSheet  String
   sourceRow    Int
 
@@ -164,6 +168,7 @@ model FulfillmentInvoice {
   subtotal         Float     @default(0)
   refunds          Float     @default(0)
   adjustments      Float     @default(0)
+  otherCost        Float     @default(0)
   total            Float     @default(0)
   sourceSheet      String
   sourceRow        Int

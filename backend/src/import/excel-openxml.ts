@@ -11,10 +11,26 @@ export type WorkbookSheet = {
   name: string;
   rows: WorkbookRow[];
   comments: Record<string, string>;
+  images: WorkbookImage[];
+  imageWarnings: WorkbookImageWarning[];
 };
 
 export type ParsedWorkbook = {
   sheets: WorkbookSheet[];
+};
+
+export type WorkbookImage = {
+  sourceRow: number;
+  sourceColumn: number;
+  mimeType: string;
+  dataUrl: string;
+  mediaPath: string;
+};
+
+export type WorkbookImageWarning = {
+  sourceRow?: number;
+  sourceColumn?: number;
+  message: string;
 };
 
 type ZipEntry = {
@@ -32,6 +48,7 @@ export function parseXlsxWorkbook(buffer: Buffer): ParsedWorkbook {
     const data = readZipEntry(buffer, entries, name);
     return data ? textDecoder.decode(data) : '';
   };
+  const getBytes = (name: string) => readZipEntry(buffer, entries, name);
 
   const sharedStrings = parseSharedStrings(getText('xl/sharedStrings.xml'));
   const workbookXml = getText('xl/workbook.xml');
@@ -42,11 +59,18 @@ export function parseXlsxWorkbook(buffer: Buffer): ParsedWorkbook {
     const target = normalizeWorkbookTarget(workbookRels[sheet.relationshipId]);
     const sheetXml = getText(target);
     const comments = readSheetComments(getText, target);
+    const { images, warnings: imageWarnings } = readSheetImages(
+      getText,
+      getBytes,
+      target,
+    );
 
     return {
       name: sheet.name,
-      rows: parseRows(sheetXml, sharedStrings),
+      rows: parseRows(sheetXml, sharedStrings, sheet.name),
       comments,
+      images,
+      imageWarnings,
     };
   });
 
@@ -180,7 +204,7 @@ function parseWorkbookSheets(xml: string) {
   return sheets;
 }
 
-function parseRows(xml: string, sharedStrings: string[]) {
+function parseRows(xml: string, sharedStrings: string[], sheetName: string) {
   const rows: WorkbookRow[] = [];
   const rowRegex = /<row\b([^>]*)>([\s\S]*?)<\/row>/g;
   const cellRegex = /<c\b([^>]*)>([\s\S]*?)<\/c>/g;
@@ -193,7 +217,13 @@ function parseRows(xml: string, sharedStrings: string[]) {
     for (const cellMatch of rowMatch[2].matchAll(cellRegex)) {
       const attrs = parseAttributes(cellMatch[1]);
       const column = columnToNumber(attrs.r || '');
-      const value = parseCellValue(cellMatch[2], attrs.t, sharedStrings);
+      const value = parseCellValue(
+        cellMatch[2],
+        attrs.t,
+        sharedStrings,
+        sheetName,
+        column,
+      );
 
       if (column > 0 && value !== null && value !== '') {
         cells[column] = value;
@@ -212,6 +242,8 @@ function parseCellValue(
   xml: string,
   type: string | undefined,
   sharedStrings: string[],
+  sheetName: string,
+  column: number,
 ): WorkbookCellValue {
   if (type === 'inlineStr') {
     return decodeXml(stripTags(xml)).trim();
@@ -229,11 +261,27 @@ function parseCellValue(
     return sharedStrings[Number(raw)] ?? '';
   }
 
+  const sharedStringValue = sharedStrings[Number(raw)];
+  if (
+    column === 1 &&
+    sheetName.toLowerCase().includes('quotation') &&
+    Number.isInteger(Number(raw)) &&
+    looksLikeQuotationContinuationLabel(sharedStringValue)
+  ) {
+    return sharedStringValue;
+  }
+
   if (raw !== '' && Number.isFinite(Number(raw))) {
     return Number(raw);
   }
 
   return raw;
+}
+
+function looksLikeQuotationContinuationLabel(value: string | undefined) {
+  if (!value) return false;
+  const text = value.replace(/\s+/g, ' ').trim().toLowerCase();
+  return /^(\d+\s*pcs?|per\s+pcs?|per\s+pieces?|per\s+order)$/.test(text);
 }
 
 function readSheetComments(
@@ -268,6 +316,151 @@ function readSheetComments(
   }
 
   return comments;
+}
+
+function readSheetImages(
+  getText: (name: string) => string,
+  getBytes: (name: string) => Buffer | null,
+  sheetTarget: string,
+): { images: WorkbookImage[]; warnings: WorkbookImageWarning[] } {
+  const fileName = sheetTarget.split('/').pop();
+  const relsXml = getText(`xl/worksheets/_rels/${fileName}.rels`);
+  const relationships = parseRelationships(relsXml);
+  const drawingTargets = Object.values(relationships).filter((target) =>
+    target.includes('drawing'),
+  );
+  const images: WorkbookImage[] = [];
+  const warnings: WorkbookImageWarning[] = [];
+
+  for (const drawingTarget of drawingTargets) {
+    try {
+      const drawingPath = normalizeRelatedTarget(
+        drawingTarget,
+        'xl/worksheets',
+      );
+      const drawingXml = getText(drawingPath);
+      if (!drawingXml) {
+        warnings.push({
+          message: `Skipped product image drawing ${drawingPath} because the drawing file is missing.`,
+        });
+        continue;
+      }
+
+      const drawingFileName = drawingPath.split('/').pop();
+      const drawingRels = parseRelationships(
+        getText(`xl/drawings/_rels/${drawingFileName}.rels`),
+      );
+      const anchorRegex =
+        /<(?:xdr:)?(?:oneCellAnchor|twoCellAnchor)\b[\s\S]*?<\/(?:xdr:)?(?:oneCellAnchor|twoCellAnchor)>/g;
+
+      for (const anchorMatch of drawingXml.matchAll(anchorRegex)) {
+        const anchorXml = anchorMatch[0];
+        const fromXml =
+          anchorXml.match(/<(?:xdr:)?from>([\s\S]*?)<\/(?:xdr:)?from>/)?.[1] ??
+          '';
+        const rowIndex = numberFromTag(fromXml, 'row');
+        const columnIndex = numberFromTag(fromXml, 'col');
+        const sourceRow = rowIndex === null ? undefined : rowIndex + 1;
+        const sourceColumn =
+          columnIndex === null ? undefined : columnIndex + 1;
+        const relationshipId = anchorXml.match(/r:embed="([^"]+)"/)?.[1];
+        const imageTarget = relationshipId
+          ? drawingRels[relationshipId]
+          : undefined;
+
+        if (rowIndex === null || columnIndex === null) {
+          warnings.push({
+            message:
+              'Skipped product image because its Excel drawing anchor is missing a row or column.',
+          });
+          continue;
+        }
+
+        if (!imageTarget) {
+          warnings.push({
+            sourceRow,
+            sourceColumn,
+            message:
+              'Skipped product image because its Excel drawing relationship is missing.',
+          });
+          continue;
+        }
+
+        const mediaPath = normalizeRelatedTarget(imageTarget, 'xl/drawings');
+        const bytes = getBytes(mediaPath);
+        const mimeType = mimeTypeForPath(mediaPath);
+
+        if (!bytes) {
+          warnings.push({
+            sourceRow,
+            sourceColumn,
+            message: `Skipped product image ${mediaPath} because the image file is missing.`,
+          });
+          continue;
+        }
+
+        if (!mimeType) {
+          warnings.push({
+            sourceRow,
+            sourceColumn,
+            message: `Skipped product image ${mediaPath} because its format is unsupported.`,
+          });
+          continue;
+        }
+
+        images.push({
+          sourceRow: rowIndex + 1,
+          sourceColumn: columnIndex + 1,
+          mimeType,
+          mediaPath,
+          dataUrl: `data:${mimeType};base64,${bytes.toString('base64')}`,
+        });
+      }
+    } catch (error) {
+      warnings.push({
+        message: `Skipped product image drawing because it could not be read: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      });
+    }
+  }
+
+  return { images, warnings };
+}
+
+function numberFromTag(xml: string, tagName: string) {
+  const match = xml.match(
+    new RegExp(`<(?:xdr:)?${tagName}>(\\d+)<\\/(?:xdr:)?${tagName}>`),
+  );
+  if (!match) return null;
+
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function normalizeRelatedTarget(target: string, basePath: string) {
+  if (target.startsWith('/')) {
+    return target.slice(1);
+  }
+
+  if (target.startsWith('../')) {
+    return `xl/${target.slice(3)}`;
+  }
+
+  if (target.startsWith('xl/')) {
+    return target;
+  }
+
+  return `${basePath}/${target}`;
+}
+
+function mimeTypeForPath(path: string) {
+  const lower = path.toLowerCase();
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  return '';
 }
 
 function normalizeWorkbookTarget(target = '') {

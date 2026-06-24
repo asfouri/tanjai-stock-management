@@ -44,8 +44,14 @@ create table if not exists public.excel_products (
   name text not null,
   description text,
   weight double precision,
+  quotation jsonb,
+  "imageUrl" text,
   "createdAt" timestamptz not null default now()
 );
+
+alter table public.excel_products
+  add column if not exists quotation jsonb,
+  add column if not exists "imageUrl" text;
 
 create unique index if not exists excel_products_name_key
   on public.excel_products (name);
@@ -71,6 +77,7 @@ create table if not exists public.excel_orders (
   "externalOrderNumber" text not null,
   "orderDate" timestamptz,
   "invoiceReference" text not null,
+  status text not null default 'CONFIRMED',
   "sourceSheet" text not null,
   "sourceRow" integer not null,
   "createdAt" timestamptz not null default now()
@@ -92,6 +99,7 @@ create table if not exists public.excel_order_lines (
   "shippingCost" double precision not null default 0,
   "handlingCost" double precision not null default 0,
   "totalCost" double precision not null default 0,
+  "lineType" text not null default 'product',
   "sourceSheet" text not null,
   "sourceRow" integer not null
 );
@@ -122,6 +130,7 @@ create table if not exists public.excel_fulfillment_invoices (
   subtotal double precision not null default 0,
   refunds double precision not null default 0,
   adjustments double precision not null default 0,
+  "otherCost" double precision not null default 0,
   total double precision not null default 0,
   "sourceSheet" text not null,
   "sourceRow" integer not null,
@@ -198,3 +207,12 @@ create table if not exists public.excel_anomalies (
   "sourceRow" integer,
   "createdAt" timestamptz not null default now()
 );
+
+alter table public.excel_orders
+  add column if not exists status text not null default 'CONFIRMED';
+
+alter table public.excel_order_lines
+  add column if not exists "lineType" text not null default 'product';
+
+alter table public.excel_fulfillment_invoices
+  add column if not exists "otherCost" double precision not null default 0;

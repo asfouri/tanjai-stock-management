@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { readdir, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { gunzip } from 'node:zlib';
@@ -69,13 +69,26 @@ type DashboardSummary = {
     trackingNumbers: string[];
     dates: string[];
   };
+  debugCounts?: DashboardDebugCounts;
 };
 
-type DatabaseRow = {
-  id?: string | number;
-  status?: string | null;
-  severity?: string | null;
-  created_at?: string | null;
+type DashboardDebugCounts = {
+  orders: number;
+  shipments: number;
+  invoices: number;
+  stockPurchases: number;
+  inventoryMovements: number;
+  walletTransactions: number;
+  products: number;
+  importBatches: number;
+  databaseHost: string;
+  storage: string;
+};
+
+type DashboardSection = {
+  title: string;
+  columns: Array<{ key: string; label: string }>;
+  rows: Array<Record<string, string | number | string[] | Record<string, unknown> | null>>;
 };
 
 @Injectable()
@@ -86,78 +99,38 @@ export class AppService {
     return 'Hello World!';
   }
 
+  async getDashboardSection(section: string): Promise<DashboardSection> {
+    switch (section) {
+      case 'products':
+        return this.getProductsSection();
+      case 'orders':
+        return this.getOrdersSection();
+      case 'inventory':
+        return this.getInventorySection();
+      case 'stores':
+        return this.getStoresSection();
+      case 'invoices':
+        return this.getInvoicesSection();
+      case 'payments':
+        return this.getPaymentsSection();
+      default:
+        return { title: 'Dashboard', columns: [], rows: [] };
+    }
+  }
+
   async getDashboardSummary(
     filters: DashboardFilters = {},
   ): Promise<DashboardSummary> {
+    const normalizedFilters = this.normalizeDashboardFilters(filters);
+
     if (process.env.EXCEL_IMPORT_STORAGE !== 'prisma') {
-      const localSummary = await this.getLocalImportDashboardSummary(filters);
+      const localSummary = await this.getLocalImportDashboardSummary(normalizedFilters);
       if (localSummary) {
         return localSummary;
       }
     }
 
-    const erpSummary = await this.getErpDashboardSummary(filters);
-
-    if (erpSummary) {
-      return erpSummary;
-    }
-
-    const [orders, requests, anomalies] = await Promise.all([
-      this.getRows('orders', 'id,status,created_at'),
-      this.getRows('requests', 'id,status,created_at'),
-      this.getRows('anomalies', 'id,status,severity,created_at'),
-    ]);
-
-    const pendingOrders = this.countByValues(orders, 'status', ['pending']);
-    const openRequests = this.countByValues(requests, 'status', [
-      'open',
-      'pending',
-    ]);
-    const unresolvedAnomalies = this.countByValues(anomalies, 'status', [
-      'open',
-      'pending',
-      'unresolved',
-    ]);
-
-    return {
-      totalOrders: orders.length,
-      totalShipments: 0,
-      totalInvoices: 0,
-      totalCosts: 0,
-      productCosts: 0,
-      shippingCosts: 0,
-      handlingCosts: 0,
-      refunds: 0,
-      currentBalance: 0,
-      stockStatus: 0,
-      totalRequests: requests.length,
-      anomaliesDetected: anomalies.length,
-      pendingOrders,
-      ordersOverTime: this.groupByDate(orders),
-      costsByDate: [],
-      ordersByStore: [],
-      costsByStore: [],
-      costDistribution: [],
-      stockByProduct: [],
-      ordersByStatus: this.groupByField(orders, 'status'),
-      requestsOverview: this.groupByField(requests, 'status'),
-      anomaliesBySeverity: this.groupByField(anomalies, 'severity'),
-      recentActivity: this.getRecentActivity(orders, requests, anomalies),
-      attentionRequired: this.getAttentionItems(
-        pendingOrders,
-        openRequests,
-        unresolvedAnomalies,
-      ),
-      filterOptions: {
-        brands: [],
-        stores: [],
-        skus: [],
-        invoices: [],
-        orderNumbers: [],
-        trackingNumbers: [],
-        dates: [],
-      },
-    };
+    return this.getErpDashboardSummary(normalizedFilters);
   }
 
   private async getLocalImportDashboardSummary(
@@ -297,21 +270,31 @@ export class AppService {
       const filteredLines = filteredOrders.flatMap((order) =>
         (order.lines ?? []).map((line) => ({ ...line, order })),
       );
+      const productLines = filteredLines.filter(
+        (line) => (line.lineType ?? 'product') === 'product',
+      );
+      const uniqueTrackingNumbers = new Set(
+        filteredOrders.flatMap((order) =>
+          (order.shipments ?? [])
+            .map((shipment) => shipment.trackingNumber)
+            .filter(Boolean),
+        ),
+      );
       const latestWallet = parsedImports
         .flatMap((item) => item.walletTransactions ?? [])
         .reverse()
         .find((transaction) => typeof transaction.runningBalance === 'number');
       const productCosts = this.round(
-        filteredLines.reduce((total, line) => total + line.productCost, 0),
+        productLines.reduce((total, line) => total + line.productCost, 0),
       );
       const shippingCosts = this.round(
-        filteredLines.reduce((total, line) => total + line.shippingCost, 0),
+        productLines.reduce((total, line) => total + line.shippingCost, 0),
       );
       const handlingCosts = this.round(
-        filteredLines.reduce((total, line) => total + line.handlingCost, 0),
+        productLines.reduce((total, line) => total + line.handlingCost, 0),
       );
       const totalCosts = this.round(
-        filteredLines.reduce((total, line) => total + line.totalCost, 0),
+        filteredInvoices.reduce((total, invoice) => total + invoice.total, 0),
       );
       const refunds = this.round(
         filteredInvoices.reduce((total, invoice) => total + invoice.refunds, 0),
@@ -319,10 +302,7 @@ export class AppService {
 
       return {
         totalOrders: filteredOrders.length,
-        totalShipments: filteredOrders.reduce(
-          (total, order) => total + (order.shipments?.length ?? 0),
-          0,
-        ),
+        totalShipments: uniqueTrackingNumbers.size,
         totalInvoices: filteredInvoices.length,
         totalCosts,
         productCosts,
@@ -337,6 +317,7 @@ export class AppService {
               movement.movementType === 'used'
                 ? -1
                 : 1;
+            if (movement.movementType === 'snapshot') return total;
             return total + movement.quantity * sign;
           }, 0),
         ),
@@ -354,6 +335,17 @@ export class AppService {
           { label: 'Shipping', total: shippingCosts },
           { label: 'Handling', total: handlingCosts },
           { label: 'Refunds', total: Math.abs(refunds) },
+          {
+            label: 'Other',
+            total: Math.abs(
+              this.round(
+                filteredInvoices.reduce(
+                  (total, invoice) => total + (invoice.otherCost ?? 0),
+                  0,
+                ),
+              ),
+            ),
+          },
         ].filter((item) => item.total > 0),
         stockByProduct: this.groupCountByLabel(
           movements.map((movement) => movement.productName ?? 'Unknown product'),
@@ -390,17 +382,47 @@ export class AppService {
 
   private async getErpDashboardSummary(
     filters: DashboardFilters,
-  ): Promise<DashboardSummary | null> {
+  ): Promise<DashboardSummary> {
     try {
+      const debugCounts = await this.getDashboardDebugCounts();
+      const dashboardRowLimit = 25000;
       const dateFilter = this.dateFilter(filters.dateFrom, filters.dateTo);
-      const storeFilter = {
-        ...(filters.store
-          ? { normalizedName: this.normalizeStoreName(filters.store) }
-          : {}),
-        ...(filters.brand ? { brand: { name: filters.brand } } : {}),
-      };
-      const orderWhere = {
-        ...(Object.keys(storeFilter).length ? { store: storeFilter } : {}),
+      const brands = await this.prisma.brand.findMany({
+        select: { id: true, name: true },
+        orderBy: { name: 'asc' },
+      });
+      const stores = await this.prisma.store.findMany({
+        select: { id: true, name: true, normalizedName: true, brandId: true },
+        orderBy: { name: 'asc' },
+      });
+      const brandIds = filters.brand
+        ? new Set(
+            brands
+              .filter((brand) => sameText(brand.name, filters.brand as string))
+              .map((brand) => brand.id),
+          )
+        : null;
+      const restrictStores = Boolean(filters.store || filters.brand);
+      const allowedStores = stores.filter((store) => {
+        if (
+          filters.store &&
+          !sameText(store.name, filters.store) &&
+          store.normalizedName !== this.normalizeStoreName(filters.store)
+        ) {
+          return false;
+        }
+        if (brandIds && !brandIds.has(store.brandId)) {
+          return false;
+        }
+        return true;
+      });
+      const allowedStoreIds = allowedStores.map((store) => store.id);
+      const storeNameById = new Map(
+        stores.map((store) => [store.id, store.name]),
+      );
+
+      const baseOrderWhere: Record<string, unknown> = {
+        ...(restrictStores ? { storeId: { in: allowedStoreIds } } : {}),
         ...(dateFilter ? { orderDate: dateFilter } : {}),
         ...(filters.orderNumber
           ? {
@@ -418,30 +440,40 @@ export class AppService {
               },
             }
           : {}),
-        ...(filters.sku
-          ? {
-              lines: {
-                some: {
-                  sku: { contains: filters.sku, mode: 'insensitive' as const },
-                },
-              },
-            }
-          : {}),
-        ...(filters.trackingNumber
-          ? {
-              shipments: {
-                some: {
-                  trackingNumber: {
-                    contains: filters.trackingNumber,
-                    mode: 'insensitive' as const,
-                  },
-                },
-              },
-            }
-          : {}),
       };
-      const invoiceWhere = {
-        ...(Object.keys(storeFilter).length ? { store: storeFilter } : {}),
+
+      const orderIdSets: string[][] = [];
+      if (filters.sku) {
+        const matchingLines = await this.prisma.orderLine.findMany({
+          where: {
+            sku: { contains: filters.sku, mode: 'insensitive' as const },
+          },
+          select: { orderId: true },
+          take: 10000,
+        });
+        orderIdSets.push(matchingLines.map((line) => line.orderId));
+      }
+      if (filters.trackingNumber) {
+        const matchingShipments = await this.prisma.shipment.findMany({
+          where: {
+            trackingNumber: {
+              contains: filters.trackingNumber,
+              mode: 'insensitive' as const,
+            },
+          },
+          select: { orderId: true },
+          take: 10000,
+        });
+        orderIdSets.push(matchingShipments.map((shipment) => shipment.orderId));
+      }
+
+      const filteredOrderIds = this.intersectIdSets(orderIdSets);
+      const orderWhere: Record<string, unknown> = {
+        ...baseOrderWhere,
+        ...(filteredOrderIds ? { id: { in: filteredOrderIds } } : {}),
+      };
+      const invoiceWhere: Record<string, unknown> = {
+        ...(restrictStores ? { storeId: { in: allowedStoreIds } } : {}),
         ...(dateFilter ? { invoiceDate: dateFilter } : {}),
         ...(filters.invoice
           ? {
@@ -452,118 +484,157 @@ export class AppService {
             }
           : {}),
       };
-      const lineWhere = { order: orderWhere };
 
-      const [
-        orders,
-        invoices,
-        shipments,
-        lines,
-        stockMovements,
-        walletTransactions,
-        anomalies,
-        brands,
-        stores,
-        aliases,
-        shipmentRecords,
-      ] = await Promise.all([
-        this.prisma.order.findMany({
-          where: orderWhere,
-          select: {
-            id: true,
-            externalOrderNumber: true,
-            orderDate: true,
-            createdAt: true,
-            store: { select: { name: true } },
-          },
-          orderBy: { createdAt: 'desc' },
-          take: 5000,
-        }),
-        this.prisma.fulfillmentInvoice.findMany({
-          where: invoiceWhere,
-          select: {
-            invoiceReference: true,
-            invoiceDate: true,
-            total: true,
-            refunds: true,
-            store: { select: { name: true } },
-          },
-          take: 5000,
-        }),
-        this.prisma.shipment.count({
-          where: { order: orderWhere },
-        }),
-        this.prisma.orderLine.findMany({
-          where: lineWhere,
-          select: {
-            sku: true,
-            productCost: true,
-            shippingCost: true,
-            handlingCost: true,
-            totalCost: true,
-            order: {
-              select: {
-                orderDate: true,
-                store: { select: { name: true } },
-              },
-            },
-          },
-          take: 10000,
-        }),
-        this.prisma.inventoryMovement.findMany({
-          select: {
-            quantity: true,
-            movementType: true,
-            product: { select: { name: true } },
-          },
-          take: 10000,
-        }),
-        this.prisma.walletTransaction.findMany({
-          orderBy: { createdAt: 'desc' },
-          take: 1,
-          select: { runningBalance: true },
-        }),
-        this.prisma.anomaly.findMany({
-          select: { id: true, severity: true, createdAt: true, message: true },
-          orderBy: { createdAt: 'desc' },
-          take: 200,
-        }),
-        this.prisma.brand.findMany({
-          select: { name: true },
-          orderBy: { name: 'asc' },
-        }),
-        this.prisma.store.findMany({
-          select: { name: true },
-          orderBy: { name: 'asc' },
-        }),
-        this.prisma.productSkuAlias.findMany({
-          select: { sku: true },
-          orderBy: { sku: 'asc' },
-          take: 500,
-        }),
-        this.prisma.shipment.findMany({
-          where: { order: orderWhere },
-          select: { trackingNumber: true },
-          orderBy: { trackingNumber: 'asc' },
-          take: 500,
-        }),
-      ]);
+      const orders = await this.prisma.order.findMany({
+        where: orderWhere,
+        select: {
+          id: true,
+          externalOrderNumber: true,
+          orderDate: true,
+          createdAt: true,
+          storeId: true,
+          status: true,
+        },
+        orderBy: { createdAt: 'desc' },
+        take: dashboardRowLimit,
+      });
+      const invoices = await this.prisma.fulfillmentInvoice.findMany({
+        where: invoiceWhere,
+        select: {
+          invoiceReference: true,
+          invoiceDate: true,
+          total: true,
+          refunds: true,
+          adjustments: true,
+          otherCost: true,
+          storeId: true,
+        },
+        take: dashboardRowLimit,
+      });
+      const anomalies = await this.prisma.anomaly.findMany({
+        select: { id: true, severity: true, createdAt: true, message: true },
+        orderBy: { createdAt: 'desc' },
+        take: 1000,
+      });
+      const aliases = await this.prisma.productSkuAlias.findMany({
+        select: { sku: true },
+        orderBy: { sku: 'asc' },
+        take: 500,
+      });
 
+      const orderIds = orders.map((order) => order.id);
+      const relatedOrderWhere =
+        orderIds.length > 0 ? { orderId: { in: orderIds } } : { orderId: '__none__' };
+      const movementWhere: Record<string, unknown> = {
+        ...(restrictStores ? { storeId: { in: allowedStoreIds } } : {}),
+        ...(dateFilter ? { movementDate: dateFilter } : {}),
+      };
+      const walletWhere: Record<string, unknown> = {
+        ...(restrictStores ? { storeId: { in: allowedStoreIds } } : {}),
+        ...(dateFilter ? { transactionDate: dateFilter } : {}),
+      };
+
+      const shipments = await this.prisma.shipment.findMany({
+        where: relatedOrderWhere,
+        select: { trackingNumber: true },
+        take: dashboardRowLimit,
+      });
+      const lines = await this.prisma.orderLine.findMany({
+        where: {
+          ...relatedOrderWhere,
+          ...(filters.sku
+            ? { sku: { contains: filters.sku, mode: 'insensitive' as const } }
+            : {}),
+        },
+        select: {
+          sku: true,
+          lineType: true,
+          productCost: true,
+          shippingCost: true,
+          handlingCost: true,
+          totalCost: true,
+          orderId: true,
+        },
+        take: dashboardRowLimit,
+      });
+      const stockMovements = await this.prisma.inventoryMovement.findMany({
+        where: movementWhere,
+        select: {
+          quantity: true,
+          movementType: true,
+          product: { select: { name: true } },
+        },
+        take: dashboardRowLimit,
+      });
+      const walletTransactions = await this.prisma.walletTransaction.findMany({
+        where: walletWhere,
+        orderBy: { createdAt: 'desc' },
+        take: dashboardRowLimit,
+        select: { runningBalance: true, amount: true },
+      });
+      const shipmentRecords = await this.prisma.shipment.findMany({
+        where: relatedOrderWhere,
+        select: { trackingNumber: true },
+        orderBy: { trackingNumber: 'asc' },
+        take: 500,
+      });
+      debugCounts.orders = Math.max(debugCounts.orders, orders.length);
+      debugCounts.invoices = Math.max(debugCounts.invoices, invoices.length);
+      debugCounts.inventoryMovements = Math.max(
+        debugCounts.inventoryMovements,
+        stockMovements.length,
+      );
+      debugCounts.walletTransactions = Math.max(
+        debugCounts.walletTransactions,
+        walletTransactions.length,
+      );
+
+      const orderById = new Map<string, (typeof orders)[number]>(
+        orders.map((order) => [order.id, order]),
+      );
+      const linesWithOrder = lines.map((line) => {
+        const order = orderById.get(line.orderId);
+        return {
+          ...line,
+          order: {
+            orderDate: order?.orderDate ?? null,
+            store: { name: storeNameById.get(order?.storeId ?? '') ?? 'Unknown store' },
+          },
+        };
+      });
+      const productLines = lines.filter(
+        (line) => (line.lineType ?? 'product') === 'product',
+      );
+      const uniqueTrackingNumbers = new Set(
+        shipments.map((shipment) => shipment.trackingNumber).filter(Boolean),
+      );
       const productCosts = this.round(
-        lines.reduce((total, line) => total + line.productCost, 0),
+        productLines.reduce((total, line) => total + line.productCost, 0),
       );
       const shippingCosts = this.round(
-        lines.reduce((total, line) => total + line.shippingCost, 0),
+        productLines.reduce((total, line) => total + line.shippingCost, 0),
       );
       const handlingCosts = this.round(
-        lines.reduce((total, line) => total + line.handlingCost, 0),
+        productLines.reduce((total, line) => total + line.handlingCost, 0),
       );
       const totalCosts = this.round(
-        lines.reduce((total, line) => total + line.totalCost, 0),
+        invoices.reduce((total, invoice) => total + invoice.total, 0),
       );
       const refunds = this.round(
         invoices.reduce((total, invoice) => total + invoice.refunds, 0),
       );
+      const latestRunningBalance = walletTransactions.find(
+        (transaction) => typeof transaction.runningBalance === 'number',
+      )?.runningBalance;
+      const currentBalance =
+        typeof latestRunningBalance === 'number'
+          ? latestRunningBalance
+          : this.round(
+              walletTransactions.reduce(
+                (total, transaction) => total + transaction.amount,
+                0,
+              ),
+            );
       const stockStatus = this.round(
         stockMovements.reduce((total, movement) => {
           const sign =
@@ -571,42 +642,54 @@ export class AppService {
             movement.movementType === 'used'
               ? -1
               : 1;
+          if (movement.movementType === 'snapshot') return total;
           return total + movement.quantity * sign;
         }, 0),
       );
 
       return {
         totalOrders: orders.length,
-        totalShipments: shipments,
+        totalShipments: uniqueTrackingNumbers.size,
         totalInvoices: invoices.length,
         totalCosts,
         productCosts,
         shippingCosts,
         handlingCosts,
         refunds,
-        currentBalance: walletTransactions[0]?.runningBalance ?? 0,
+        currentBalance,
         stockStatus,
         totalRequests: 0,
         anomaliesDetected: anomalies.length,
-        pendingOrders: 0,
+        pendingOrders: orders.filter((order) => order.status === 'PENDING_TRACKING').length,
         ordersOverTime: this.groupRecordsByDate(
           orders.map((order) => ({ date: order.orderDate })),
         ),
-        costsByDate: this.groupCostByDate(lines),
+        costsByDate: this.groupCostByDate(linesWithOrder),
         ordersByStore: this.groupCountByLabel(
-          orders.map((order) => order.store.name),
+          orders.map((order) => storeNameById.get(order.storeId) ?? 'Unknown store'),
         ),
-        costsByStore: this.groupCostByStore(lines),
+        costsByStore: this.groupCostByStore(linesWithOrder),
         costDistribution: [
           { label: 'Product', total: productCosts },
           { label: 'Shipping', total: shippingCosts },
           { label: 'Handling', total: handlingCosts },
           { label: 'Refunds', total: Math.abs(refunds) },
+          {
+            label: 'Other',
+            total: Math.abs(
+              this.round(
+                invoices.reduce(
+                  (total, invoice) => total + (invoice.otherCost ?? 0),
+                  0,
+                ),
+              ),
+            ),
+          },
         ].filter((item) => item.total > 0),
         stockByProduct: this.groupStockByProduct(stockMovements),
         ordersByStatus: [],
         requestsOverview: [],
-        anomaliesBySeverity: this.groupByField(anomalies, 'severity'),
+        anomaliesBySeverity: this.groupBySeverity(anomalies),
         recentActivity: [
           ...orders.slice(0, 5).map((order) => ({
             id: `order-${order.id}`,
@@ -636,17 +719,15 @@ export class AppService {
           brands: brands.map((brand) => brand.name),
           stores: stores.map((store) => store.name),
           skus: aliases.map((alias) => alias.sku),
-          invoices: invoices
-            .map((invoice) => invoice.invoiceReference)
-            .filter(Boolean)
-            .slice(0, 500),
-          orderNumbers: orders
-            .map((order) => order.externalOrderNumber)
-            .filter(Boolean)
-            .slice(0, 500),
-          trackingNumbers: shipmentRecords
-            .map((shipment) => shipment.trackingNumber)
-            .filter(Boolean),
+          invoices: this.uniqueOptions(
+            invoices.map((invoice) => invoice.invoiceReference),
+          ),
+          orderNumbers: this.uniqueOptions(
+            orders.map((order) => order.externalOrderNumber),
+          ),
+          trackingNumbers: this.uniqueOptions(
+            shipmentRecords.map((shipment) => shipment.trackingNumber),
+          ),
           dates: [
             ...new Set(
               [
@@ -658,137 +739,520 @@ export class AppService {
             ),
           ].sort(),
         },
+        debugCounts,
       };
-    } catch {
-      return null;
+    } catch (error) {
+      console.error('Dashboard ERP summary failed', error);
+      const message = error instanceof Error ? error.message : String(error);
+      throw new InternalServerErrorException(
+        `Dashboard summary failed: ${message}`,
+      );
     }
   }
 
-  private async getRows(table: string, select: string): Promise<DatabaseRow[]> {
-    const supabaseUrl = process.env.SUPABASE_URL?.replace(/\/$/, '');
-    const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  private async getDashboardDebugCounts(): Promise<DashboardDebugCounts> {
+    const orders = await this.safeCount(this.prisma.order);
+    const shipments = await this.safeCount(this.prisma.shipment);
+    const invoices = await this.safeCount(this.prisma.fulfillmentInvoice);
+    const stockPurchases = await this.safeCount(this.prisma.stockPurchase);
+    const inventoryMovements = await this.safeCount(this.prisma.inventoryMovement);
+    const walletTransactions = await this.safeCount(this.prisma.walletTransaction);
+    const products = await this.safeCount(this.prisma.product);
+    const importBatches = await this.safeCount(this.prisma.importBatch);
 
-    if (!supabaseUrl || !serviceRoleKey) {
-      return [];
+    const debugCounts = {
+      orders,
+      shipments,
+      invoices,
+      stockPurchases,
+      inventoryMovements,
+      walletTransactions,
+      products,
+      importBatches,
+      databaseHost: this.databaseHost(),
+      storage: process.env.EXCEL_IMPORT_STORAGE ?? '',
+    };
+
+    return debugCounts;
+  }
+
+  private async safeCount(delegate: { count: () => Promise<number> }) {
+    try {
+      return await delegate.count();
+    } catch {
+      return 0;
+    }
+  }
+
+  private databaseHost() {
+    try {
+      return process.env.DATABASE_URL
+        ? new URL(process.env.DATABASE_URL).host
+        : '';
+    } catch {
+      return '';
+    }
+  }
+
+  private intersectIdSets(idSets: string[][]) {
+    if (idSets.length === 0) return null;
+    return [
+      ...idSets
+        .slice(1)
+        .reduce(
+          (intersection, ids) => {
+            const current = new Set(ids);
+            return new Set([...intersection].filter((id) => current.has(id)));
+          },
+          new Set(idSets[0]),
+        ),
+    ];
+  }
+
+  private async getProductsSection(): Promise<DashboardSection> {
+    try {
+      return await this.loadProductsSection(true);
+    } catch (error) {
+      if (this.isMissingProductQuotationColumn(error)) {
+        return this.loadProductsSection(false);
+      }
+      throw error;
+    }
+  }
+
+  private async loadProductsSection(includeQuotation: boolean): Promise<DashboardSection> {
+    const select: Record<string, unknown> = {
+      id: true,
+      name: true,
+      description: true,
+      weight: true,
+      imageUrl: true,
+      skuAliases: {
+        select: { sku: true, store: { select: { name: true } } },
+        orderBy: { sku: 'asc' },
+      },
+      inventoryMovements: {
+        select: { quantity: true, movementType: true },
+        take: 1000,
+      },
+      _count: {
+        select: {
+          orderLines: true,
+          stockPurchases: true,
+          inventoryMovements: true,
+        },
+      },
+    };
+
+    if (includeQuotation) {
+      select.quotation = true;
     }
 
-    try {
-      const params = new URLSearchParams({
-        select,
-        limit: '1000',
-        order: 'created_at.desc',
-      });
-      const response = await fetch(`${supabaseUrl}/rest/v1/${table}?${params}`, {
-        headers: {
-          apikey: serviceRoleKey,
-          Authorization: `Bearer ${serviceRoleKey}`,
-        },
-      });
+    const products = await this.prisma.product.findMany({
+      orderBy: { name: 'asc' },
+      take: 5000,
+      select,
+    });
+    const catalogProducts = products.filter((product) =>
+      this.isCatalogProduct(product, includeQuotation),
+    );
 
-      if (!response.ok) {
-        return [];
+    return {
+      title: 'Products',
+      columns: [
+        { key: 'name', label: 'Product' },
+        { key: 'skus', label: 'SKUs' },
+        { key: 'weight', label: 'Weight' },
+        { key: 'orderLines', label: 'Order lines' },
+        { key: 'stockPurchases', label: 'Stock purchases' },
+      ],
+      rows: catalogProducts.map((product) => ({
+        id: product.id,
+        name: product.name,
+        description: product.description ?? '',
+        imageUrl: product.imageUrl ?? null,
+        skuAliases: product.skuAliases.map((alias) => alias.sku),
+        quotation:
+          includeQuotation && 'quotation' in product
+            ? this.normalizeQuotationForResponse(product.quotation) ?? null
+            : null,
+        stores: [
+          ...new Set(
+            product.skuAliases
+              .map((alias) => alias.store?.name)
+              .filter((store): store is string => Boolean(store)),
+          ),
+        ],
+        skus: product.skuAliases.map((alias) => alias.sku).join(', ') || '-',
+        weight: product.weight ?? null,
+        orderLines: product._count.orderLines,
+        stockPurchases: product._count.stockPurchases,
+        inventoryMovements: product._count.inventoryMovements,
+        currentInventory: this.round(
+          product.inventoryMovements.reduce((total, movement) => {
+            if (movement.movementType === 'snapshot') return total;
+            const sign =
+              movement.movementType === 'consumption' ||
+              movement.movementType === 'used'
+                ? -1
+                : 1;
+            return total + movement.quantity * sign;
+          }, 0),
+        ),
+      })),
+    };
+  }
+
+  private normalizeQuotationForResponse(quotation: unknown) {
+    if (!quotation || typeof quotation !== 'object' || Array.isArray(quotation)) {
+      return quotation;
+    }
+
+    const record = quotation as Record<string, unknown>;
+    if (!Array.isArray(record.quotationRows)) {
+      return quotation;
+    }
+
+    let changed = false;
+    const quotationRows = record.quotationRows.map((row) => {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) {
+        return row;
       }
 
-      const rows = (await response.json()) as DatabaseRow[];
+      const rowRecord = row as Record<string, unknown>;
+      const existingQuantityLabel = rowRecord.quantityLabel;
+      if (
+        existingQuantityLabel !== null &&
+        existingQuantityLabel !== undefined &&
+        String(existingQuantityLabel).trim()
+      ) {
+        return row;
+      }
 
-      return Array.isArray(rows) ? rows : [];
-    } catch {
-      return [];
+      const quantity = rowRecord.quantity;
+      if (quantity === null || quantity === undefined) {
+        return row;
+      }
+
+      const quantityLabel = String(quantity).trim();
+      if (!quantityLabel) {
+        return row;
+      }
+
+      changed = true;
+      return { ...rowRecord, quantityLabel };
+    });
+
+    return changed ? { ...record, quotationRows } : quotation;
+  }
+
+  private isCatalogProduct(product: any, includeQuotation: boolean) {
+    const aliases = Array.isArray(product.skuAliases)
+      ? product.skuAliases.map((alias: { sku?: string }) => alias.sku ?? '')
+      : [];
+    if (
+      !this.isValidCatalogProductName(product.name) ||
+      this.isSkuOnlyProductName(product.name, aliases)
+    ) {
+      return false;
     }
+
+    if (includeQuotation && this.hasCatalogData(product.quotation)) {
+      return true;
+    }
+    if (this.cleanCatalogText(product.description)) {
+      return true;
+    }
+    if (this.cleanCatalogText(product.imageUrl)) {
+      return true;
+    }
+    if (typeof product.weight === 'number' && Number.isFinite(product.weight)) {
+      return true;
+    }
+
+    return aliases.length > 0;
   }
 
-  private countByValues(
-    rows: DatabaseRow[],
-    field: 'status' | 'severity',
-    values: string[],
-  ): number {
-    const acceptedValues = new Set(values.map((value) => value.toLowerCase()));
-
-    return rows.filter((row) => {
-      const value = row[field]?.toLowerCase();
-
-      return value ? acceptedValues.has(value) : false;
-    }).length;
+  private hasCatalogData(value: unknown): boolean {
+    if (value === null || value === undefined || value === '') return false;
+    if (typeof value === 'string') return this.cleanCatalogText(value).length > 0;
+    if (typeof value === 'number' || typeof value === 'boolean') return true;
+    if (Array.isArray(value)) return value.some((item) => this.hasCatalogData(item));
+    if (typeof value === 'object') {
+      return Object.values(value as Record<string, unknown>).some((item) =>
+        this.hasCatalogData(item),
+      );
+    }
+    return false;
   }
 
-  private groupByField(
-    rows: DatabaseRow[],
-    field: 'status' | 'severity',
-  ): ChartPoint[] {
+  private isSkuOnlyProductName(name: string, aliases: string[]) {
+    const normalizedName = this.cleanCatalogText(name).toLowerCase();
+    if (!normalizedName) return true;
+    if (aliases.some((alias) => this.cleanCatalogText(alias).toLowerCase() === normalizedName)) {
+      return true;
+    }
+    if (/^\d+([_\-\s]\d+)*$/.test(normalizedName)) {
+      return true;
+    }
+    if (/^[a-z0-9_-]+$/.test(normalizedName) && /\d/.test(normalizedName)) {
+      return true;
+    }
+    return false;
+  }
+
+  private isValidCatalogProductName(name: string) {
+    const normalizedName = this.cleanCatalogText(name).toLowerCase();
+    if (!normalizedName || normalizedName === '/' || normalizedName === 'no.') {
+      return false;
+    }
+
+    const knownCategoryLabels = new Set([
+      'hydromax',
+      'pant+pands',
+      'pants',
+    ]);
+    if (knownCategoryLabels.has(normalizedName)) {
+      return false;
+    }
+
+    if (
+      normalizedName.includes('stock at warehouse') ||
+      normalizedName.includes('factory have prepare stock') ||
+      normalizedName.includes('will removed') ||
+      normalizedName.includes('will be removed') ||
+      normalizedName.includes('per pcs') ||
+      normalizedName.includes('per order') ||
+      normalizedName.includes('ship only')
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private cleanCatalogText(value: unknown) {
+    if (value === null || value === undefined) return '';
+    return String(value).replace(/\s+/g, ' ').trim();
+  }
+
+  private isMissingProductQuotationColumn(error: unknown) {
+    const message =
+      error instanceof Error
+        ? `${error.message} ${JSON.stringify((error as { code?: string; meta?: unknown }).meta ?? {})}`
+        : String(error);
+
+    return (
+      message.includes('quotation') &&
+      (message.includes('does not exist') ||
+        message.includes('column') ||
+        message.includes('P2022'))
+    );
+  }
+
+  private async getOrdersSection(): Promise<DashboardSection> {
+    const orders = await this.prisma.order.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 500,
+      select: {
+        externalOrderNumber: true,
+        orderDate: true,
+        invoiceReference: true,
+        status: true,
+        store: { select: { name: true } },
+        _count: { select: { lines: true, shipments: true } },
+      },
+    });
+
+    return {
+      title: 'Orders',
+      columns: [
+        { key: 'orderNumber', label: 'Order number' },
+        { key: 'store', label: 'Store' },
+        { key: 'invoice', label: 'Invoice' },
+        { key: 'status', label: 'Status' },
+        { key: 'date', label: 'Date' },
+        { key: 'lines', label: 'Lines' },
+        { key: 'shipments', label: 'Shipments' },
+      ],
+      rows: orders.map((order) => ({
+        orderNumber: order.externalOrderNumber,
+        store: order.store.name,
+        invoice: order.invoiceReference,
+        status: this.formatLabel(order.status),
+        date: this.formatDateValue(order.orderDate),
+        lines: order._count.lines,
+        shipments: order._count.shipments,
+      })),
+    };
+  }
+
+  private async getInventorySection(): Promise<DashboardSection> {
+    const movements = await this.prisma.inventoryMovement.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 500,
+      select: {
+        movementDate: true,
+        movementType: true,
+        quantity: true,
+        reference: true,
+        product: { select: { name: true } },
+        store: { select: { name: true } },
+      },
+    });
+
+    return {
+      title: 'Inventory',
+      columns: [
+        { key: 'date', label: 'Date' },
+        { key: 'product', label: 'Product' },
+        { key: 'store', label: 'Store' },
+        { key: 'type', label: 'Type' },
+        { key: 'quantity', label: 'Quantity' },
+        { key: 'reference', label: 'Reference' },
+      ],
+      rows: movements.map((movement) => ({
+        date: this.formatDateValue(movement.movementDate),
+        product: movement.product?.name ?? '-',
+        store: movement.store?.name ?? '-',
+        type: this.formatLabel(movement.movementType),
+        quantity: movement.quantity,
+        reference: movement.reference ?? '-',
+      })),
+    };
+  }
+
+  private async getStoresSection(): Promise<DashboardSection> {
+    const stores = await this.prisma.store.findMany({
+      orderBy: { name: 'asc' },
+      take: 500,
+      select: {
+        name: true,
+        country: true,
+        platform: true,
+        brand: { select: { name: true } },
+        _count: {
+          select: {
+            orders: true,
+            fulfillmentInvoices: true,
+            walletTransactions: true,
+            inventoryMovements: true,
+          },
+        },
+      },
+    });
+
+    return {
+      title: 'Stores',
+      columns: [
+        { key: 'name', label: 'Store' },
+        { key: 'brand', label: 'Brand' },
+        { key: 'country', label: 'Country' },
+        { key: 'platform', label: 'Platform' },
+        { key: 'orders', label: 'Orders' },
+        { key: 'invoices', label: 'Invoices' },
+      ],
+      rows: stores.map((store) => ({
+        name: store.name,
+        brand: store.brand.name,
+        country: store.country ?? '-',
+        platform: store.platform ?? '-',
+        orders: store._count.orders,
+        invoices: store._count.fulfillmentInvoices,
+      })),
+    };
+  }
+
+  private async getInvoicesSection(): Promise<DashboardSection> {
+    const invoices = await this.prisma.fulfillmentInvoice.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 500,
+      select: {
+        invoiceReference: true,
+        invoiceDate: true,
+        subtotal: true,
+        refunds: true,
+        adjustments: true,
+        otherCost: true,
+        total: true,
+        store: { select: { name: true } },
+      },
+    });
+
+    return {
+      title: 'Invoices',
+      columns: [
+        { key: 'invoice', label: 'Invoice' },
+        { key: 'store', label: 'Store' },
+        { key: 'date', label: 'Date' },
+        { key: 'subtotal', label: 'Subtotal' },
+        { key: 'refunds', label: 'Refunds' },
+        { key: 'otherCost', label: 'Other' },
+        { key: 'total', label: 'Total' },
+      ],
+      rows: invoices.map((invoice) => ({
+        invoice: invoice.invoiceReference,
+        store: invoice.store.name,
+        date: this.formatDateValue(invoice.invoiceDate),
+        subtotal: this.round(invoice.subtotal),
+        refunds: this.round(invoice.refunds),
+        otherCost: this.round(invoice.otherCost),
+        total: this.round(invoice.total),
+      })),
+    };
+  }
+
+  private async getPaymentsSection(): Promise<DashboardSection> {
+    const stores = await this.prisma.store.findMany({
+      select: { id: true, name: true },
+    });
+    const storeNameById = new Map(stores.map((store) => [store.id, store.name]));
+    const payments = await this.prisma.walletTransaction.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 500,
+      select: {
+        transactionDate: true,
+        transactionType: true,
+        invoiceReference: true,
+        amount: true,
+        runningBalance: true,
+        storeId: true,
+      },
+    });
+
+    return {
+      title: 'Payments',
+      columns: [
+        { key: 'date', label: 'Date' },
+        { key: 'store', label: 'Store' },
+        { key: 'type', label: 'Type' },
+        { key: 'invoice', label: 'Invoice' },
+        { key: 'amount', label: 'Amount' },
+        { key: 'balance', label: 'Balance' },
+      ],
+      rows: payments.map((payment) => ({
+        date: this.formatDateValue(payment.transactionDate),
+        store: payment.storeId ? storeNameById.get(payment.storeId) ?? '-' : '-',
+        type: this.formatLabel(payment.transactionType),
+        invoice: payment.invoiceReference ?? '-',
+        amount: this.round(payment.amount),
+        balance:
+          typeof payment.runningBalance === 'number'
+            ? this.round(payment.runningBalance)
+            : '-',
+      })),
+    };
+  }
+
+  private groupBySeverity(rows: Array<{ severity?: string | null }>): ChartPoint[] {
     const groups = rows.reduce<Record<string, number>>((totals, row) => {
-      const label = this.formatLabel(row[field] || 'unknown');
+      const label = this.formatLabel(row.severity || 'unknown');
       totals[label] = (totals[label] ?? 0) + 1;
 
       return totals;
     }, {});
 
     return Object.entries(groups).map(([label, total]) => ({ label, total }));
-  }
-
-  private groupByDate(rows: DatabaseRow[]): ChartPoint[] {
-    const groups = rows.reduce<Record<string, number>>((totals, row) => {
-      if (!row.created_at) {
-        return totals;
-      }
-
-      const label = new Date(row.created_at).toLocaleDateString('en-US', {
-        month: 'short',
-        day: 'numeric',
-      });
-      totals[label] = (totals[label] ?? 0) + 1;
-
-      return totals;
-    }, {});
-
-    return Object.entries(groups)
-      .map(([label, total]) => ({ label, total }))
-      .slice(-7);
-  }
-
-  private getRecentActivity(
-    orders: DatabaseRow[],
-    requests: DatabaseRow[],
-    anomalies: DatabaseRow[],
-  ): ActivityItem[] {
-    return [
-      ...this.toActivityItems(orders, 'Order'),
-      ...this.toActivityItems(requests, 'Request'),
-      ...this.toActivityItems(anomalies, 'Anomaly'),
-    ]
-      .sort((first, second) => {
-        const firstDate = first.createdAt
-          ? new Date(first.createdAt).getTime()
-          : 0;
-        const secondDate = second.createdAt
-          ? new Date(second.createdAt).getTime()
-          : 0;
-
-        return secondDate - firstDate;
-      })
-      .slice(0, 5);
-  }
-
-  private toActivityItems(rows: DatabaseRow[], type: string): ActivityItem[] {
-    return rows
-      .filter((row) => row.id)
-      .map((row) => ({
-        id: `${type.toLowerCase()}-${row.id}`,
-        type,
-        title: `${type} ${row.id}`,
-        createdAt: row.created_at ?? null,
-      }));
-  }
-
-  private getAttentionItems(
-    pendingOrders: number,
-    openRequests: number,
-    unresolvedAnomalies: number,
-  ): AttentionItem[] {
-    return [
-      { label: 'Pending orders', total: pendingOrders },
-      { label: 'Open requests', total: openRequests },
-      { label: 'Unresolved anomalies', total: unresolvedAnomalies },
-    ].filter((item) => item.total > 0);
   }
 
   private formatLabel(value: string): string {
@@ -805,6 +1269,29 @@ export class AppService {
     return Object.keys(filter).length ? filter : null;
   }
 
+  private normalizeDashboardFilters(filters: DashboardFilters) {
+    return Object.fromEntries(
+      Object.entries(filters).map(([key, value]) => {
+        const normalizedValue = typeof value === 'string' ? value.trim() : value;
+        return [
+          key,
+          this.isAllFilterValue(key, normalizedValue) ? '' : normalizedValue,
+        ];
+      }),
+    ) as DashboardFilters;
+  }
+
+  private isAllFilterValue(key: string, value: unknown) {
+    if (typeof value !== 'string') return false;
+    const normalizedValue = value.trim().toLowerCase();
+    return (
+      normalizedValue === 'all' ||
+      normalizedValue === `all ${key.toLowerCase()}s` ||
+      (key === 'brand' && normalizedValue === 'all brands') ||
+      (key === 'store' && normalizedValue === 'all stores')
+    );
+  }
+
   private normalizeStoreName(value: string) {
     return value.trim().toLowerCase().replace(/\s+/g, ' ');
   }
@@ -814,6 +1301,10 @@ export class AppService {
     const date = value instanceof Date ? value : new Date(value);
     if (Number.isNaN(date.getTime())) return null;
     return date.toISOString().slice(0, 10);
+  }
+
+  private formatDateValue(value: string | Date | null | undefined) {
+    return this.toDateOption(value) ?? '-';
   }
 
   private groupRecordsByDate(records: Array<{ date: Date | null }>) {
@@ -873,6 +1364,19 @@ export class AppService {
       .slice(0, 12);
   }
 
+  private uniqueOptions(values: Array<string | number | null | undefined>) {
+    return [
+      ...new Set(
+        values
+          .filter((value): value is string | number => value !== null && value !== undefined)
+          .map(String)
+          .filter(Boolean),
+      ),
+    ]
+      .sort((left, right) => left.localeCompare(right))
+      .slice(0, 500);
+  }
+
   private groupStockByProduct(
     movements: Array<{
       quantity: number;
@@ -886,6 +1390,7 @@ export class AppService {
         item.movementType === 'consumption' || item.movementType === 'used'
           ? -1
           : 1;
+      if (item.movementType === 'snapshot') return totals;
       totals[label] = (totals[label] ?? 0) + item.quantity * sign;
       return totals;
     }, {});

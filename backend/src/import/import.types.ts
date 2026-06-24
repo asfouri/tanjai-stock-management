@@ -24,6 +24,51 @@ export type ParsedProduct = {
   weight?: number;
   sku?: string;
   storeName?: string;
+  imageUrl?: string;
+  source?: 'quotation' | 'fallback' | 'stock_header';
+  quotation?: {
+    unitPrice?: number;
+    weight?: number;
+    moq?: string;
+    quantity?: number;
+    quantityConditions?: string[];
+    freightByCountry?: Array<{ country: string; amount: number }>;
+    serviceFee?: number;
+    landedCost?: number;
+    landedCostByCountry?: Array<{ country: string; amount: number }>;
+    deliveryTime?: string;
+    sellingPrice?: number;
+    stockNotes?: string[];
+    notes?: string[];
+    quotationRows?: Array<{
+      sourceKey?: string;
+      sourceSheet?: string;
+      sourceRow?: number;
+      quantityLabel?: string;
+      quantity?: string;
+      unitPrice?: string;
+      weight?: string;
+      freightFR?: string;
+      freightDE?: string;
+      freightGB?: string;
+      freightUSA?: string;
+      serviceFee?: string;
+      totalCostFR?: string;
+      totalCostDE?: string;
+      totalCostGB?: string;
+      totalCostUSA?: string;
+      deliveryTime?: string;
+      sellingPrice?: string;
+      notes?: string;
+    }>;
+    priceTiers?: Array<{
+      quantity?: number;
+      unitPrice?: number;
+      landedCost?: number;
+      sellingPrice?: number;
+    }>;
+    retired?: boolean;
+  };
 };
 
 export type ParsedOrderLine = SourceRef & {
@@ -33,6 +78,7 @@ export type ParsedOrderLine = SourceRef & {
   shippingCost: number;
   handlingCost: number;
   totalCost: number;
+  lineType: 'product' | 'refund' | 'adjustment';
 };
 
 export type ParsedShipment = SourceRef & {
@@ -44,6 +90,7 @@ export type ParsedOrder = SourceRef & {
   externalOrderNumber: string;
   orderDate?: Date;
   invoiceReference: string;
+  status: 'CONFIRMED' | 'PENDING_TRACKING';
   lines: ParsedOrderLine[];
   shipments: ParsedShipment[];
 };
@@ -55,6 +102,7 @@ export type ParsedFulfillmentInvoice = SourceRef & {
   subtotal: number;
   refunds: number;
   adjustments: number;
+  otherCost: number;
   total: number;
 };
 
