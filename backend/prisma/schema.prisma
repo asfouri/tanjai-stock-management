@@ -236,6 +236,7 @@ model WalletTransaction {
   invoiceReference String?
   amount           Float
   runningBalance   Float?
+  exchangeRate     Float?
   sourceSheet      String
   sourceRow        Int
   createdAt        DateTime  @default(now())

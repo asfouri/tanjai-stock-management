@@ -1,5 +1,6 @@
 export type SheetType =
   | 'quotation'
+  | 'sku_decoder'
   | 'store_orders'
   | 'stock_invoice'
   | 'stock_list'
@@ -83,6 +84,7 @@ export type ParsedOrderLine = SourceRef & {
 
 export type ParsedShipment = SourceRef & {
   trackingNumber: string;
+  estimatedDelivery?: Date;
 };
 
 export type ParsedOrder = SourceRef & {
@@ -132,6 +134,7 @@ export type ParsedWalletTransaction = SourceRef & {
   invoiceReference?: string;
   amount: number;
   runningBalance?: number;
+  exchangeRate?: number;
 };
 
 export type ImportWarning = SourceRef & {

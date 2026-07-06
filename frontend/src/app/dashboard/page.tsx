@@ -17,254 +17,37 @@ import {
   YAxis,
 } from "recharts";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
-
-type ChartPoint = {
-  label: string;
-  total: number;
-};
-
-type ActivityItem = {
-  id: string;
-  type: string;
-  title: string;
-  createdAt: string | null;
-};
-
-type AttentionItem = {
-  label: string;
-  total: number;
-};
-
-type FilterOptions = {
-  brands: string[];
-  stores: string[];
-  skus: string[];
-  invoices: string[];
-  orderNumbers: string[];
-  trackingNumbers: string[];
-  dates: string[];
-};
-
-type DashboardSummary = {
-  totalOrders: number;
-  totalShipments: number;
-  totalInvoices: number;
-  totalCosts: number;
-  productCosts: number;
-  shippingCosts: number;
-  handlingCosts: number;
-  refunds: number;
-  currentBalance: number;
-  stockStatus: number;
-  totalRequests: number;
-  anomaliesDetected: number;
-  pendingOrders: number;
-  ordersOverTime: ChartPoint[];
-  costsByDate: ChartPoint[];
-  ordersByStore: ChartPoint[];
-  costsByStore: ChartPoint[];
-  costDistribution: ChartPoint[];
-  stockByProduct: ChartPoint[];
-  ordersByStatus: ChartPoint[];
-  requestsOverview: ChartPoint[];
-  anomaliesBySeverity: ChartPoint[];
-  recentActivity: ActivityItem[];
-  attentionRequired: AttentionItem[];
-  filterOptions: FilterOptions;
-  debugCounts?: {
-    orders: number;
-    shipments: number;
-    invoices: number;
-    stockPurchases: number;
-    inventoryMovements: number;
-    walletTransactions: number;
-    products: number;
-    importBatches: number;
-    databaseHost: string;
-    storage: string;
-  };
-};
-
-type ImportPreview = {
-  token: string;
-  fileName: string;
-  detectedSheets: Array<{
-    name: string;
-    type: string;
-    rows: number;
-    invoiceBlocks?: number;
-  }>;
-  stores: Array<{ name: string; normalizedName: string }>;
-  counts: {
-    orders: number;
-    invoices: number;
-    shipments: number;
-    refunds: number;
-    stockPurchases: number;
-    stockMovements: number;
-    walletTransactions: number;
-    warnings: number;
-    duplicateRecords: number;
-  };
-  totals: {
-    productCosts: number;
-    shippingCosts: number;
-    handlingCosts: number;
-    invoiceCosts: number;
-    refunds: number;
-    currentBalance: number | null;
-  };
-  duplicateRecords: string[];
-  warnings: Array<{
-    sourceSheet: string;
-    sourceRow: number;
-    severity: string;
-    message: string;
-  }>;
-};
-
-type Filters = {
-  brand: string;
-  store: string;
-  dateFrom: string;
-  dateTo: string;
-  sku: string;
-  invoice: string;
-  orderNumber: string;
-  trackingNumber: string;
-};
-
-type SectionId =
-  | "dashboard"
-  | "imports"
-  | "products"
-  | "orders"
-  | "inventory"
-  | "stores"
-  | "invoices"
-  | "payments";
-
-type SectionData = {
-  title: string;
-  columns: Array<{ key: string; label: string }>;
-  rows: Array<Record<string, string | number | string[] | ProductQuotation | null>>;
-};
-
-type ProductQuotation = {
-  unitPrice?: number;
-  weight?: number;
-  moq?: string;
-  quantity?: number;
-  quantityConditions?: string[];
-  freightByCountry?: Array<{ country: string; amount: number }>;
-  serviceFee?: number;
-  landedCost?: number;
-  landedCostByCountry?: Array<{ country: string; amount: number }>;
-  deliveryTime?: string;
-  sellingPrice?: number;
-  stockNotes?: string[];
-  notes?: string[];
-  quotationRows?: QuotationOfferRow[];
-  priceTiers?: Array<{
-    quantity?: number;
-    unitPrice?: number;
-    landedCost?: number;
-    sellingPrice?: number;
-  }>;
-  retired?: boolean;
-};
-
-type QuotationOfferRow = {
-  sourceKey?: string;
-  sourceSheet?: string;
-  sourceRow?: number;
-  quantityLabel?: string | number;
-  quantity?: string | number;
-  unitPrice?: string | number;
-  weight?: string | number;
-  freightFR?: string | number;
-  freightDE?: string | number;
-  freightGB?: string | number;
-  freightUSA?: string | number;
-  serviceFee?: string | number;
-  totalCostFR?: string | number;
-  totalCostDE?: string | number;
-  totalCostGB?: string | number;
-  totalCostUSA?: string | number;
-  deliveryTime?: string | number;
-  sellingPrice?: string | number;
-  notes?: string;
-};
-
-type ProductRow = {
-  id?: string;
-  name: string;
-  description?: string;
-  imageUrl?: string | null;
-  skuAliases?: string[];
-  stores?: string[];
-  skus?: string;
-  weight: number | string | null;
-  orderLines: number;
-  stockPurchases: number;
-  inventoryMovements?: number;
-  currentInventory?: number;
-  quotation?: ProductQuotation | null;
-};
-
-type ImportBatchRow = {
-  id: string;
-  fileName: string;
-  fileHash: string;
-  fileHashStatus: string;
-  status: string;
-  importedAt: string;
-  orders: number;
-  invoices: number;
-  products: number;
-  stockPurchases: number;
-  inventoryMovements: number;
-  walletTransactions: number;
-  warnings: number;
-  anomalies: number;
-  duplicates: number;
-};
-
-const emptySummary: DashboardSummary = {
-  totalOrders: 0,
-  totalShipments: 0,
-  totalInvoices: 0,
-  totalCosts: 0,
-  productCosts: 0,
-  shippingCosts: 0,
-  handlingCosts: 0,
-  refunds: 0,
-  currentBalance: 0,
-  stockStatus: 0,
-  totalRequests: 0,
-  anomaliesDetected: 0,
-  pendingOrders: 0,
-  ordersOverTime: [],
-  costsByDate: [],
-  ordersByStore: [],
-  costsByStore: [],
-  costDistribution: [],
-  stockByProduct: [],
-  ordersByStatus: [],
-  requestsOverview: [],
-  anomaliesBySeverity: [],
-  recentActivity: [],
-  attentionRequired: [],
-  filterOptions: {
-    brands: [],
-    stores: [],
-    skus: [],
-    invoices: [],
-    orderNumbers: [],
-    trackingNumbers: [],
-    dates: [],
-  },
-};
+import { apiBaseUrl, apiFetch, responseErrorMessage } from "./api";
+import { FilterInput, FilterSelect } from "./components/FilterBar";
+import { EmptyState, Panel } from "./components/Panel";
+import { ProductImage } from "./components/ProductImage";
+import type {
+  ChartPoint,
+  DashboardSummary,
+  Filters,
+  ImportBatchRow,
+  ImportPreview,
+  ProductQuotation,
+  ProductRow,
+  QuotationOfferRow,
+  SectionData,
+  SectionId,
+} from "./types";
+import {
+  cleanKeyPart,
+  emptySummary,
+  formatCellValue,
+  formatCurrency,
+  formatDate,
+  formatNumber,
+  getUserDisplayName,
+  normalizeSummary,
+  productRowKey,
+  quotationRowKey,
+  recordRowKey,
+  uniqueByKey,
+  uniqueNonEmptyStrings,
+} from "./utils";
 
 const initialFilters: Filters = {
   brand: "",
@@ -290,246 +73,9 @@ const sidebarItems: Array<{ id: SectionId; label: string }> = [
 
 const chartColors = ["#18181b", "#0f766e", "#b45309", "#991b1b", "#52525b"];
 
-const apiBaseUrl = (
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:3005"
-).replace(/\/$/, "");
-
-async function responseErrorMessage(response: Response, fallback: string) {
-  const body = await response.json().catch(() => null);
-  const message = body?.message;
-  if (Array.isArray(message)) return message.join(" ");
-  return typeof message === "string" && message.trim() ? message : fallback;
-}
-
-function getUserDisplayName(user: User | null) {
-  const firstName = user?.user_metadata?.first_name;
-  const lastName = user?.user_metadata?.last_name;
-  const fullName = [firstName, lastName].filter(Boolean).join(" ");
-
-  return fullName || user?.email || "User";
-}
-
-function normalizeSummary(summary: Partial<DashboardSummary>): DashboardSummary {
-  return {
-    ...emptySummary,
-    ...summary,
-    filterOptions: {
-      ...emptySummary.filterOptions,
-      ...summary.filterOptions,
-    },
-  };
-}
-
-function formatCurrency(value: number) {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: 2,
-  }).format(value);
-}
-
-function formatNumber(value: number) {
-  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(
-    value
-  );
-}
-
-function formatDate(value: string | null) {
-  if (!value) return "No date";
-
-  return new Date(value).toLocaleDateString("en-US", {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  });
-}
-
-function formatCellValue(value: unknown) {
-  if (value === null || value === undefined || value === "") return "-";
-  if (Array.isArray(value)) return value.length > 0 ? value.join(", ") : "-";
-  if (typeof value === "number") return formatNumber(value);
-  if (typeof value === "object") return JSON.stringify(value);
-  return String(value);
-}
-
-function cleanKeyPart(value: unknown) {
-  if (value === null || value === undefined) return "";
-  return String(value).trim();
-}
-
-function uniqueNonEmptyStrings(values: Array<string | number | null | undefined> = []) {
-  const seen = new Set<string>();
-  const items: string[] = [];
-
-  for (const value of values) {
-    const item = cleanKeyPart(value);
-    if (!item || seen.has(item)) continue;
-    seen.add(item);
-    items.push(item);
-  }
-
-  return items;
-}
-
-function uniqueByKey<T>(items: T[], getKey: (item: T) => string | null) {
-  const seen = new Set<string>();
-  const uniqueItems: T[] = [];
-
-  for (const item of items) {
-    const key = getKey(item);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    uniqueItems.push(item);
-  }
-
-  return uniqueItems;
-}
-
-function productRowKey(product: ProductRow) {
-  const id = cleanKeyPart(product.id);
-  if (id) return id;
-
-  const name = cleanKeyPart(product.name);
-  return name ? `product-name:${name}` : null;
-}
-
-function quotationRowKey(row: QuotationOfferRow) {
-  const sourceKey = cleanKeyPart(row.sourceKey);
-  if (sourceKey) return sourceKey;
-
-  const sourceSheet = cleanKeyPart(row.sourceSheet);
-  if (sourceSheet && row.sourceRow !== null && row.sourceRow !== undefined) {
-    return `${sourceSheet}-${row.sourceRow}`;
-  }
-
-  return null;
-}
-
-function recordRowKey(row: Record<string, unknown>) {
-  const id = cleanKeyPart(row.id);
-  if (id) return id;
-
-  const stableValue = JSON.stringify(row);
-  return stableValue === "{}" ? null : stableValue;
-}
-
-function ProductImage({
-  src,
-  alt,
-  size,
-}: {
-  src?: string | null;
-  alt: string;
-  size: "small" | "large";
-}) {
-  const hasImage = Boolean(cleanKeyPart(src));
-  const className =
-    size === "large"
-      ? "h-56 w-full max-w-sm rounded-md border border-zinc-200 object-contain"
-      : "h-14 w-14 rounded-md border border-zinc-200 object-contain";
-
-  if (hasImage) {
-    return (
-      <img
-        alt={alt}
-        className={`${className} bg-white`}
-        loading="lazy"
-        src={src ?? undefined}
-      />
-    );
-  }
-
-  return (
-    <div
-      aria-label="No product image"
-      className={`${className} flex items-center justify-center bg-zinc-50 text-xs font-medium text-zinc-400`}
-      role="img"
-    >
-      No image
-    </div>
-  );
-}
-
-function Panel({
-  title,
-  children,
-}: Readonly<{ title: string; children: React.ReactNode }>) {
-  return (
-    <section className="min-w-0 rounded-lg border border-zinc-200 bg-white p-5 shadow-sm">
-      <h2 className="text-base font-semibold">{title}</h2>
-      <div className="mt-5 min-w-0">{children}</div>
-    </section>
-  );
-}
-
-function EmptyState({ label }: { label: string }) {
-  return (
-    <div className="flex h-52 items-center justify-center rounded-md border border-dashed border-zinc-200 text-sm text-zinc-500">
-      {label}
-    </div>
-  );
-}
-
-function FilterSelect({
-  label,
-  placeholder,
-  value,
-  options,
-  onChange,
-}: {
-  label: string;
-  placeholder: string;
-  value: string;
-  options: string[];
-  onChange: (value: string) => void;
-}) {
-  const normalizedOptions = uniqueNonEmptyStrings(options);
-
-  return (
-    <label className="grid gap-1 text-xs font-medium text-zinc-500">
-      {label}
-      <select
-        className="h-10 rounded-md border border-zinc-300 bg-white px-3 text-sm text-zinc-900 outline-none transition focus:border-zinc-900"
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      >
-        <option value="">{placeholder}</option>
-        {normalizedOptions.map((option) => (
-          <option key={option} value={option}>
-            {option}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
-}
-
-function FilterInput({
-  label,
-  value,
-  onChange,
-  placeholder,
-  type = "text",
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  placeholder?: string;
-  type?: string;
-}) {
-  return (
-    <label className="grid gap-1 text-xs font-medium text-zinc-500">
-      {label}
-      <input
-        className="h-10 rounded-md border border-zinc-300 bg-white px-3 text-sm text-zinc-900 outline-none transition focus:border-zinc-900"
-        placeholder={placeholder}
-        type={type}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      />
-    </label>
-  );
-}
+type CachedSectionId = Exclude<SectionId, "dashboard" | "imports">;
+type SectionDataCache = Partial<Record<CachedSectionId, SectionData>>;
+type LoadedSectionCache = Partial<Record<Exclude<SectionId, "dashboard">, true>>;
 
 export default function DashboardPage() {
   const router = useRouter();
@@ -537,7 +83,9 @@ export default function DashboardPage() {
   const [user, setUser] = useState<User | null>(null);
   const [activeSection, setActiveSection] = useState<SectionId>("dashboard");
   const [summary, setSummary] = useState<DashboardSummary>(emptySummary);
-  const [sectionData, setSectionData] = useState<SectionData | null>(null);
+  const [sectionDataCache, setSectionDataCache] = useState<SectionDataCache>({});
+  const [loadedSectionCache, setLoadedSectionCache] =
+    useState<LoadedSectionCache>({});
   const [importBatches, setImportBatches] = useState<ImportBatchRow[]>([]);
   const [productSearch, setProductSearch] = useState("");
   const [productPage, setProductPage] = useState(1);
@@ -548,13 +96,19 @@ export default function DashboardPage() {
   } | null>(null);
   const [filters, setFilters] = useState<Filters>(initialFilters);
   const [isLoading, setIsLoading] = useState(true);
-  const [isSectionLoading, setIsSectionLoading] = useState(false);
+  const [loadingSection, setLoadingSection] = useState<SectionId | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [isRemovingImport, setIsRemovingImport] = useState(false);
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [errorMessage, setErrorMessage] = useState("");
   const [importErrorMessage, setImportErrorMessage] = useState("");
   const [refreshKey, setRefreshKey] = useState(0);
+
+  const sectionData =
+    activeSection !== "dashboard" && activeSection !== "imports"
+      ? (sectionDataCache[activeSection] ?? null)
+      : null;
+  const isSectionLoading = loadingSection === activeSection;
 
   const filterQuery = useMemo(() => {
     const params = new URLSearchParams();
@@ -579,14 +133,8 @@ export default function DashboardPage() {
 
         if (isMounted) setUser(data.user);
 
-        const session = await supabase.auth.getSession();
-        const response = await fetch(
+        const response = await apiFetch(
           `${apiBaseUrl}/dashboard/summary${filterQuery ? `?${filterQuery}` : ""}`,
-          {
-            headers: session.data.session?.access_token
-              ? { Authorization: `Bearer ${session.data.session.access_token}` }
-              : undefined,
-          }
         );
 
         if (!response.ok) {
@@ -619,19 +167,22 @@ export default function DashboardPage() {
 
   useEffect(() => {
     if (activeSection === "dashboard") {
-      setSectionData(null);
+      return;
+    }
+
+    if (loadedSectionCache[activeSection]) {
       return;
     }
 
     let isMounted = true;
 
     async function loadSection() {
-      setIsSectionLoading(true);
+      setLoadingSection(activeSection);
       setErrorMessage("");
 
       try {
         if (activeSection === "imports") {
-          const response = await fetch(`${apiBaseUrl}/imports/excel/history`);
+          const response = await apiFetch(`${apiBaseUrl}/imports/excel/history`);
           if (!response.ok) {
             throw new Error(
               await responseErrorMessage(response, "Unable to load import history.")
@@ -640,12 +191,12 @@ export default function DashboardPage() {
           const data = (await response.json()) as ImportBatchRow[];
           if (isMounted) {
             setImportBatches(data);
-            setSectionData(null);
+            setLoadedSectionCache((cache) => ({ ...cache, imports: true }));
           }
           return;
         }
 
-        const response = await fetch(
+        const response = await apiFetch(
           `${apiBaseUrl}/dashboard/section/${activeSection}`
         );
 
@@ -656,7 +207,16 @@ export default function DashboardPage() {
         }
 
         const data = (await response.json()) as SectionData;
-        if (isMounted) setSectionData(data);
+        if (isMounted) {
+          setSectionDataCache((cache) => ({
+            ...cache,
+            [activeSection]: data,
+          }));
+          setLoadedSectionCache((cache) => ({
+            ...cache,
+            [activeSection]: true,
+          }));
+        }
       } catch (error) {
         if (isMounted) {
           setErrorMessage(
@@ -664,7 +224,11 @@ export default function DashboardPage() {
           );
         }
       } finally {
-        if (isMounted) setIsSectionLoading(false);
+        if (isMounted) {
+          setLoadingSection((section) =>
+            section === activeSection ? null : section
+          );
+        }
       }
     }
 
@@ -673,15 +237,11 @@ export default function DashboardPage() {
     return () => {
       isMounted = false;
     };
-  }, [activeSection, refreshKey]);
-
-  useEffect(() => {
-    setProductPage(1);
-  }, [productSearch, sectionData]);
+  }, [activeSection, loadedSectionCache, refreshKey]);
 
   async function refreshDashboard() {
     setIsLoading(true);
-    const response = await fetch(
+    const response = await apiFetch(
       `${apiBaseUrl}/dashboard/summary${filterQuery ? `?${filterQuery}` : ""}`
     );
     if (response.ok) {
@@ -692,6 +252,11 @@ export default function DashboardPage() {
       );
     }
     setIsLoading(false);
+  }
+
+  function invalidateSectionCache() {
+    setSectionDataCache({});
+    setLoadedSectionCache({});
   }
 
   async function handleLogout() {
@@ -716,7 +281,7 @@ export default function DashboardPage() {
     setErrorMessage("");
 
     try {
-      const response = await fetch(`${apiBaseUrl}/imports/excel/preview-local`, {
+      const response = await apiFetch(`${apiBaseUrl}/imports/excel/preview-local`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -747,7 +312,7 @@ export default function DashboardPage() {
     setImportErrorMessage("");
 
     try {
-      const response = await fetch(`${apiBaseUrl}/imports/excel/confirm`, {
+      const response = await apiFetch(`${apiBaseUrl}/imports/excel/confirm`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: preview.token }),
@@ -759,6 +324,7 @@ export default function DashboardPage() {
       }
 
       setPreview(null);
+      invalidateSectionCache();
       await refreshDashboard();
       setRefreshKey((value) => value + 1);
     } catch (error) {
@@ -777,7 +343,7 @@ export default function DashboardPage() {
     setErrorMessage("");
 
     try {
-      const response = await fetch(`${apiBaseUrl}/imports/excel/remove`, {
+      const response = await apiFetch(`${apiBaseUrl}/imports/excel/remove`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ importBatchId: selectedImportAction.batch.id }),
@@ -790,6 +356,7 @@ export default function DashboardPage() {
 
       const shouldOpenUpload = selectedImportAction.mode === "replace";
       setSelectedImportAction(null);
+      invalidateSectionCache();
       await refreshDashboard();
       setRefreshKey((value) => value + 1);
 
@@ -1116,7 +683,10 @@ export default function DashboardPage() {
                 page={productPage}
                 search={productSearch}
                 onPageChange={setProductPage}
-                onSearchChange={setProductSearch}
+                onSearchChange={(value) => {
+                  setProductSearch(value);
+                  setProductPage(1);
+                }}
                 onSelectProduct={setSelectedProduct}
               />
             ) : (

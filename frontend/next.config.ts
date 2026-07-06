@@ -1,7 +1,5 @@
 import type { NextConfig } from "next";
 
-const nextConfig: NextConfig = {
-  allowedDevOrigins: ["untangled-cattishly-speckled.ngrok-free.dev"],
-};
+const nextConfig: NextConfig = {};
 
 export default nextConfig;

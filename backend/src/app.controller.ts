@@ -8,8 +8,10 @@ import {
   Post,
   Query,
   Req,
+  UseGuards,
 } from '@nestjs/common';
 import { AppService } from './app.service';
+import { SupabaseAuthGuard } from './auth/supabase-auth.guard';
 import { ExcelImportService } from './import/excel-import.service';
 import type { IncomingMessage } from 'node:http';
 
@@ -26,16 +28,19 @@ export class AppController {
   }
 
   @Get('dashboard/summary')
+  @UseGuards(SupabaseAuthGuard)
   getDashboardSummary(@Query() filters: Record<string, string>) {
     return this.appService.getDashboardSummary(filters);
   }
 
   @Get('dashboard/section/:section')
+  @UseGuards(SupabaseAuthGuard)
   getDashboardSection(@Param('section') section: string) {
     return this.appService.getDashboardSection(section);
   }
 
   @Post('imports/excel/preview')
+  @UseGuards(SupabaseAuthGuard)
   async previewExcelImport(
     @Req() request: IncomingMessage,
     @Headers('x-file-name') fileName = '',
@@ -51,26 +56,31 @@ export class AppController {
   }
 
   @Post('imports/excel/preview-local')
+  @UseGuards(SupabaseAuthGuard)
   previewLocalExcelImport(@Body('fileName') fileName: string) {
     return this.excelImportService.previewLocalFile(fileName);
   }
 
   @Post('imports/excel/confirm')
+  @UseGuards(SupabaseAuthGuard)
   confirmExcelImport(@Body('token') token: string) {
     return this.excelImportService.confirm(token);
   }
 
   @Get('imports/excel/history')
+  @UseGuards(SupabaseAuthGuard)
   listExcelImports() {
     return this.excelImportService.listImportBatches();
   }
 
   @Post('imports/excel/remove')
+  @UseGuards(SupabaseAuthGuard)
   removeExcelImport(@Body('importBatchId') importBatchId: string) {
     return this.excelImportService.removeImportBatch(importBatchId);
   }
 
   @Post('imports/excel/replace')
+  @UseGuards(SupabaseAuthGuard)
   replaceExcelImport(
     @Body('importBatchId') importBatchId: string,
     @Body('token') token: string,
@@ -79,7 +89,10 @@ export class AppController {
   }
 }
 
-function readRequestBuffer(request: IncomingMessage, maxBytes: number): Promise<Buffer> {
+function readRequestBuffer(
+  request: IncomingMessage,
+  maxBytes: number,
+): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;

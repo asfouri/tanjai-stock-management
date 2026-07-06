@@ -1,95 +1,12 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
-import { readdir, readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
-import { gunzip } from 'node:zlib';
-import { promisify } from 'node:util';
+import {
+  ChartPoint,
+  DashboardDebugCounts,
+  DashboardFilters,
+  DashboardSection,
+  DashboardSummary,
+} from './app.types';
 import { PrismaService } from './prisma.service';
-
-const gunzipAsync = promisify(gunzip);
-
-type ChartPoint = {
-  label: string;
-  total: number;
-};
-
-type ActivityItem = {
-  id: string;
-  type: string;
-  title: string;
-  createdAt: string | null;
-};
-
-type AttentionItem = {
-  label: string;
-  total: number;
-};
-
-type DashboardFilters = {
-  brand?: string;
-  store?: string;
-  dateFrom?: string;
-  dateTo?: string;
-  sku?: string;
-  invoice?: string;
-  orderNumber?: string;
-  trackingNumber?: string;
-};
-
-type DashboardSummary = {
-  totalOrders: number;
-  totalShipments: number;
-  totalInvoices: number;
-  totalCosts: number;
-  productCosts: number;
-  shippingCosts: number;
-  handlingCosts: number;
-  refunds: number;
-  currentBalance: number;
-  stockStatus: number;
-  totalRequests: number;
-  anomaliesDetected: number;
-  pendingOrders: number;
-  ordersOverTime: ChartPoint[];
-  costsByDate: ChartPoint[];
-  ordersByStore: ChartPoint[];
-  costsByStore: ChartPoint[];
-  costDistribution: ChartPoint[];
-  stockByProduct: ChartPoint[];
-  ordersByStatus: ChartPoint[];
-  requestsOverview: ChartPoint[];
-  anomaliesBySeverity: ChartPoint[];
-  recentActivity: ActivityItem[];
-  attentionRequired: AttentionItem[];
-  filterOptions: {
-    brands: string[];
-    stores: string[];
-    skus: string[];
-    invoices: string[];
-    orderNumbers: string[];
-    trackingNumbers: string[];
-    dates: string[];
-  };
-  debugCounts?: DashboardDebugCounts;
-};
-
-type DashboardDebugCounts = {
-  orders: number;
-  shipments: number;
-  invoices: number;
-  stockPurchases: number;
-  inventoryMovements: number;
-  walletTransactions: number;
-  products: number;
-  importBatches: number;
-  databaseHost: string;
-  storage: string;
-};
-
-type DashboardSection = {
-  title: string;
-  columns: Array<{ key: string; label: string }>;
-  rows: Array<Record<string, string | number | string[] | Record<string, unknown> | null>>;
-};
 
 @Injectable()
 export class AppService {
@@ -122,262 +39,7 @@ export class AppService {
     filters: DashboardFilters = {},
   ): Promise<DashboardSummary> {
     const normalizedFilters = this.normalizeDashboardFilters(filters);
-
-    if (process.env.EXCEL_IMPORT_STORAGE !== 'prisma') {
-      const localSummary = await this.getLocalImportDashboardSummary(normalizedFilters);
-      if (localSummary) {
-        return localSummary;
-      }
-    }
-
     return this.getErpDashboardSummary(normalizedFilters);
-  }
-
-  private async getLocalImportDashboardSummary(
-    filters: DashboardFilters,
-  ): Promise<DashboardSummary | null> {
-    try {
-      const importDir = resolve(process.cwd(), 'local-imports');
-      const files = (await readdir(importDir)).filter((file) =>
-        file.endsWith('.json.gz'),
-      );
-
-      if (files.length === 0) {
-        return null;
-      }
-
-      const imports = await Promise.all(
-        files.map(async (file) => {
-          const compressed = await readFile(resolve(importDir, file));
-          return JSON.parse((await gunzipAsync(compressed)).toString('utf8'));
-        }),
-      );
-      const parsedImports = imports.map((item) => item.parsed);
-      const orders = parsedImports.flatMap((item) => item.orders ?? []);
-      const invoices = parsedImports.flatMap((item) => item.invoices ?? []);
-      const movements = parsedImports.flatMap(
-        (item) => item.inventoryMovements ?? [],
-      );
-      const warnings = parsedImports.flatMap((item) => item.warnings ?? []);
-      const lines = orders.flatMap((order) =>
-        (order.lines ?? []).map((line) => ({ ...line, order })),
-      );
-      const brandNames = [
-        ...new Set(
-          parsedImports
-            .map((item) => item.brandName)
-            .filter((value): value is string => Boolean(value)),
-        ),
-      ].sort();
-      const stores = [
-        ...new Set(
-          parsedImports.flatMap(
-            (item) =>
-              item.stores
-                ?.map((store) => store.name)
-                .filter((name) => !isBrandOwnerName(name)) ?? [],
-          ),
-        ),
-      ].sort();
-      const skus = [...new Set(lines.map((line) => line.sku).filter(Boolean))]
-        .sort()
-        .slice(0, 500);
-      const invoiceRefs = [
-        ...new Set(invoices.map((invoice) => invoice.invoiceReference).filter(Boolean)),
-      ].slice(0, 500);
-      const orderNumbers = [
-        ...new Set(
-          orders
-            .map((order) => order.externalOrderNumber)
-            .filter(Boolean)
-            .map(String),
-        ),
-      ]
-        .sort()
-        .slice(0, 500);
-      const trackingNumbers = [
-        ...new Set(
-          orders.flatMap((order) =>
-            (order.shipments ?? [])
-              .map((shipment) => shipment.trackingNumber)
-              .filter(Boolean)
-              .map(String),
-          ),
-        ),
-      ]
-        .sort()
-        .slice(0, 500);
-      const dates = [
-        ...new Set(
-          [
-            ...orders.map((order) => order.orderDate),
-            ...invoices.map((invoice) => invoice.invoiceDate),
-          ]
-            .map((value) => this.toDateOption(value))
-            .filter((value): value is string => Boolean(value)),
-        ),
-      ].sort();
-      const filteredOrders = orders.filter((order) => {
-        if (filters.store && !sameText(order.storeName, filters.store)) return false;
-        if (
-          filters.orderNumber &&
-          !String(order.externalOrderNumber)
-            .toLowerCase()
-            .includes(filters.orderNumber.toLowerCase())
-        ) {
-          return false;
-        }
-        if (
-          filters.invoice &&
-          !String(order.invoiceReference)
-            .toLowerCase()
-            .includes(filters.invoice.toLowerCase())
-        ) {
-          return false;
-        }
-        if (
-          filters.sku &&
-          !(order.lines ?? []).some((line) =>
-            String(line.sku).toLowerCase().includes(filters.sku!.toLowerCase()),
-          )
-        ) {
-          return false;
-        }
-        if (
-          filters.trackingNumber &&
-          !(order.shipments ?? []).some((shipment) =>
-            String(shipment.trackingNumber)
-              .toLowerCase()
-              .includes(filters.trackingNumber!.toLowerCase()),
-          )
-        ) {
-          return false;
-        }
-        return this.isInDateRange(order.orderDate, filters);
-      });
-      const filteredInvoices = invoices.filter((invoice) => {
-        if (filters.store && !sameText(invoice.storeName, filters.store)) return false;
-        if (
-          filters.invoice &&
-          !String(invoice.invoiceReference)
-            .toLowerCase()
-            .includes(filters.invoice.toLowerCase())
-        ) {
-          return false;
-        }
-        return this.isInDateRange(invoice.invoiceDate, filters);
-      });
-      const filteredLines = filteredOrders.flatMap((order) =>
-        (order.lines ?? []).map((line) => ({ ...line, order })),
-      );
-      const productLines = filteredLines.filter(
-        (line) => (line.lineType ?? 'product') === 'product',
-      );
-      const uniqueTrackingNumbers = new Set(
-        filteredOrders.flatMap((order) =>
-          (order.shipments ?? [])
-            .map((shipment) => shipment.trackingNumber)
-            .filter(Boolean),
-        ),
-      );
-      const latestWallet = parsedImports
-        .flatMap((item) => item.walletTransactions ?? [])
-        .reverse()
-        .find((transaction) => typeof transaction.runningBalance === 'number');
-      const productCosts = this.round(
-        productLines.reduce((total, line) => total + line.productCost, 0),
-      );
-      const shippingCosts = this.round(
-        productLines.reduce((total, line) => total + line.shippingCost, 0),
-      );
-      const handlingCosts = this.round(
-        productLines.reduce((total, line) => total + line.handlingCost, 0),
-      );
-      const totalCosts = this.round(
-        filteredInvoices.reduce((total, invoice) => total + invoice.total, 0),
-      );
-      const refunds = this.round(
-        filteredInvoices.reduce((total, invoice) => total + invoice.refunds, 0),
-      );
-
-      return {
-        totalOrders: filteredOrders.length,
-        totalShipments: uniqueTrackingNumbers.size,
-        totalInvoices: filteredInvoices.length,
-        totalCosts,
-        productCosts,
-        shippingCosts,
-        handlingCosts,
-        refunds,
-        currentBalance: latestWallet?.runningBalance ?? 0,
-        stockStatus: this.round(
-          movements.reduce((total, movement) => {
-            const sign =
-              movement.movementType === 'consumption' ||
-              movement.movementType === 'used'
-                ? -1
-                : 1;
-            if (movement.movementType === 'snapshot') return total;
-            return total + movement.quantity * sign;
-          }, 0),
-        ),
-        totalRequests: 0,
-        anomaliesDetected: warnings.length,
-        pendingOrders: 0,
-        ordersOverTime: this.groupLocalOrdersByDate(filteredOrders),
-        costsByDate: this.groupLocalCostsByDate(filteredLines),
-        ordersByStore: this.groupCountByLabel(
-          filteredOrders.map((order) => order.storeName),
-        ),
-        costsByStore: this.groupLocalCostsByStore(filteredLines),
-        costDistribution: [
-          { label: 'Product', total: productCosts },
-          { label: 'Shipping', total: shippingCosts },
-          { label: 'Handling', total: handlingCosts },
-          { label: 'Refunds', total: Math.abs(refunds) },
-          {
-            label: 'Other',
-            total: Math.abs(
-              this.round(
-                filteredInvoices.reduce(
-                  (total, invoice) => total + (invoice.otherCost ?? 0),
-                  0,
-                ),
-              ),
-            ),
-          },
-        ].filter((item) => item.total > 0),
-        stockByProduct: this.groupCountByLabel(
-          movements.map((movement) => movement.productName ?? 'Unknown product'),
-        ),
-        ordersByStatus: [],
-        requestsOverview: [],
-        anomaliesBySeverity: this.groupCountByLabel(
-          warnings.map((warning) => warning.severity ?? 'warning'),
-        ),
-        recentActivity: filteredOrders.slice(0, 5).map((order) => ({
-          id: `order-${order.externalOrderNumber}-${order.invoiceReference}`,
-          type: 'Order',
-          title: `Order ${order.externalOrderNumber}`,
-          createdAt: order.orderDate ?? null,
-        })),
-        attentionRequired: warnings.slice(0, 5).map((warning) => ({
-          label: warning.message,
-          total: 1,
-        })),
-        filterOptions: {
-          brands: brandNames.length > 0 ? brandNames : ['TanjAI'],
-          stores,
-          skus,
-          invoices: invoiceRefs,
-          orderNumbers,
-          trackingNumbers,
-          dates,
-        },
-      };
-    } catch {
-      return null;
-    }
   }
 
   private async getErpDashboardSummary(
@@ -485,6 +147,14 @@ export class AppService {
           : {}),
       };
 
+      const totalOrders = await this.prisma.order.count({ where: orderWhere });
+      const totalInvoices = await this.prisma.fulfillmentInvoice.count({
+        where: invoiceWhere,
+      });
+      const pendingOrders = await this.prisma.order.count({
+        where: { ...orderWhere, status: 'PENDING_TRACKING' },
+      });
+
       const orders = await this.prisma.order.findMany({
         where: orderWhere,
         select: {
@@ -524,7 +194,9 @@ export class AppService {
 
       const orderIds = orders.map((order) => order.id);
       const relatedOrderWhere =
-        orderIds.length > 0 ? { orderId: { in: orderIds } } : { orderId: '__none__' };
+        orderIds.length > 0
+          ? { orderId: { in: orderIds } }
+          : { orderId: '__none__' };
       const movementWhere: Record<string, unknown> = {
         ...(restrictStores ? { storeId: { in: allowedStoreIds } } : {}),
         ...(dateFilter ? { movementDate: dateFilter } : {}),
@@ -534,11 +206,6 @@ export class AppService {
         ...(dateFilter ? { transactionDate: dateFilter } : {}),
       };
 
-      const shipments = await this.prisma.shipment.findMany({
-        where: relatedOrderWhere,
-        select: { trackingNumber: true },
-        take: dashboardRowLimit,
-      });
       const lines = await this.prisma.orderLine.findMany({
         where: {
           ...relatedOrderWhere,
@@ -566,27 +233,58 @@ export class AppService {
         },
         take: dashboardRowLimit,
       });
-      const walletTransactions = await this.prisma.walletTransaction.findMany({
+      const walletTransactionCount = await this.prisma.walletTransaction.count({
         where: walletWhere,
-        orderBy: { createdAt: 'desc' },
-        take: dashboardRowLimit,
-        select: { runningBalance: true, amount: true },
       });
       const shipmentRecords = await this.prisma.shipment.findMany({
-        where: relatedOrderWhere,
+        where: { order: orderWhere },
         select: { trackingNumber: true },
         orderBy: { trackingNumber: 'asc' },
         take: 500,
       });
-      debugCounts.orders = Math.max(debugCounts.orders, orders.length);
-      debugCounts.invoices = Math.max(debugCounts.invoices, invoices.length);
+      const totalShipments = await this.prisma.shipment.count({
+        where: { order: orderWhere },
+      });
+      const costAgg = await this.prisma.orderLine.aggregate({
+        where: {
+          order: orderWhere,
+          lineType: 'product',
+          ...(filters.sku
+            ? { sku: { contains: filters.sku, mode: 'insensitive' as const } }
+            : {}),
+        },
+        _sum: { productCost: true, shippingCost: true, handlingCost: true },
+      });
+      const invoiceAgg = await this.prisma.fulfillmentInvoice.aggregate({
+        where: invoiceWhere,
+        _sum: { total: true, refunds: true, otherCost: true },
+      });
+      const latestWithBalance = await this.prisma.walletTransaction.findFirst({
+        where: {
+          ...walletWhere,
+          runningBalance: { not: null },
+        },
+        orderBy: { transactionDate: 'desc' },
+        select: { runningBalance: true },
+      });
+      const currentBalance =
+        latestWithBalance?.runningBalance ??
+        (await this.prisma.walletTransaction
+          .aggregate({
+            where: walletWhere,
+            _sum: { amount: true },
+          })
+          .then((result) => this.round(result._sum.amount ?? 0)));
+
+      debugCounts.orders = Math.max(debugCounts.orders, totalOrders);
+      debugCounts.invoices = Math.max(debugCounts.invoices, totalInvoices);
       debugCounts.inventoryMovements = Math.max(
         debugCounts.inventoryMovements,
         stockMovements.length,
       );
       debugCounts.walletTransactions = Math.max(
         debugCounts.walletTransactions,
-        walletTransactions.length,
+        walletTransactionCount,
       );
 
       const orderById = new Map<string, (typeof orders)[number]>(
@@ -598,43 +296,18 @@ export class AppService {
           ...line,
           order: {
             orderDate: order?.orderDate ?? null,
-            store: { name: storeNameById.get(order?.storeId ?? '') ?? 'Unknown store' },
+            store: {
+              name: storeNameById.get(order?.storeId ?? '') ?? 'Unknown store',
+            },
           },
         };
       });
-      const productLines = lines.filter(
-        (line) => (line.lineType ?? 'product') === 'product',
-      );
-      const uniqueTrackingNumbers = new Set(
-        shipments.map((shipment) => shipment.trackingNumber).filter(Boolean),
-      );
-      const productCosts = this.round(
-        productLines.reduce((total, line) => total + line.productCost, 0),
-      );
-      const shippingCosts = this.round(
-        productLines.reduce((total, line) => total + line.shippingCost, 0),
-      );
-      const handlingCosts = this.round(
-        productLines.reduce((total, line) => total + line.handlingCost, 0),
-      );
-      const totalCosts = this.round(
-        invoices.reduce((total, invoice) => total + invoice.total, 0),
-      );
-      const refunds = this.round(
-        invoices.reduce((total, invoice) => total + invoice.refunds, 0),
-      );
-      const latestRunningBalance = walletTransactions.find(
-        (transaction) => typeof transaction.runningBalance === 'number',
-      )?.runningBalance;
-      const currentBalance =
-        typeof latestRunningBalance === 'number'
-          ? latestRunningBalance
-          : this.round(
-              walletTransactions.reduce(
-                (total, transaction) => total + transaction.amount,
-                0,
-              ),
-            );
+      const productCosts = this.round(costAgg._sum.productCost ?? 0);
+      const shippingCosts = this.round(costAgg._sum.shippingCost ?? 0);
+      const handlingCosts = this.round(costAgg._sum.handlingCost ?? 0);
+      const totalCosts = this.round(invoiceAgg._sum.total ?? 0);
+      const refunds = this.round(invoiceAgg._sum.refunds ?? 0);
+      const otherCosts = this.round(invoiceAgg._sum.otherCost ?? 0);
       const stockStatus = this.round(
         stockMovements.reduce((total, movement) => {
           const sign =
@@ -648,9 +321,9 @@ export class AppService {
       );
 
       return {
-        totalOrders: orders.length,
-        totalShipments: uniqueTrackingNumbers.size,
-        totalInvoices: invoices.length,
+        totalOrders,
+        totalShipments,
+        totalInvoices,
         totalCosts,
         productCosts,
         shippingCosts,
@@ -660,13 +333,15 @@ export class AppService {
         stockStatus,
         totalRequests: 0,
         anomaliesDetected: anomalies.length,
-        pendingOrders: orders.filter((order) => order.status === 'PENDING_TRACKING').length,
+        pendingOrders,
         ordersOverTime: this.groupRecordsByDate(
           orders.map((order) => ({ date: order.orderDate })),
         ),
         costsByDate: this.groupCostByDate(linesWithOrder),
         ordersByStore: this.groupCountByLabel(
-          orders.map((order) => storeNameById.get(order.storeId) ?? 'Unknown store'),
+          orders.map(
+            (order) => storeNameById.get(order.storeId) ?? 'Unknown store',
+          ),
         ),
         costsByStore: this.groupCostByStore(linesWithOrder),
         costDistribution: [
@@ -676,14 +351,7 @@ export class AppService {
           { label: 'Refunds', total: Math.abs(refunds) },
           {
             label: 'Other',
-            total: Math.abs(
-              this.round(
-                invoices.reduce(
-                  (total, invoice) => total + (invoice.otherCost ?? 0),
-                  0,
-                ),
-              ),
-            ),
+            total: Math.abs(otherCosts),
           },
         ].filter((item) => item.total > 0),
         stockByProduct: this.groupStockByProduct(stockMovements),
@@ -755,8 +423,12 @@ export class AppService {
     const shipments = await this.safeCount(this.prisma.shipment);
     const invoices = await this.safeCount(this.prisma.fulfillmentInvoice);
     const stockPurchases = await this.safeCount(this.prisma.stockPurchase);
-    const inventoryMovements = await this.safeCount(this.prisma.inventoryMovement);
-    const walletTransactions = await this.safeCount(this.prisma.walletTransaction);
+    const inventoryMovements = await this.safeCount(
+      this.prisma.inventoryMovement,
+    );
+    const walletTransactions = await this.safeCount(
+      this.prisma.walletTransaction,
+    );
     const products = await this.safeCount(this.prisma.product);
     const importBatches = await this.safeCount(this.prisma.importBatch);
 
@@ -797,15 +469,10 @@ export class AppService {
   private intersectIdSets(idSets: string[][]) {
     if (idSets.length === 0) return null;
     return [
-      ...idSets
-        .slice(1)
-        .reduce(
-          (intersection, ids) => {
-            const current = new Set(ids);
-            return new Set([...intersection].filter((id) => current.has(id)));
-          },
-          new Set(idSets[0]),
-        ),
+      ...idSets.slice(1).reduce((intersection, ids) => {
+        const current = new Set(ids);
+        return new Set([...intersection].filter((id) => current.has(id)));
+      }, new Set(idSets[0])),
     ];
   }
 
@@ -820,7 +487,9 @@ export class AppService {
     }
   }
 
-  private async loadProductsSection(includeQuotation: boolean): Promise<DashboardSection> {
+  private async loadProductsSection(
+    includeQuotation: boolean,
+  ): Promise<DashboardSection> {
     const select: Record<string, unknown> = {
       id: true,
       name: true,
@@ -874,7 +543,7 @@ export class AppService {
         skuAliases: product.skuAliases.map((alias) => alias.sku),
         quotation:
           includeQuotation && 'quotation' in product
-            ? this.normalizeQuotationForResponse(product.quotation) ?? null
+            ? (this.normalizeQuotationForResponse(product.quotation) ?? null)
             : null,
         stores: [
           ...new Set(
@@ -904,7 +573,11 @@ export class AppService {
   }
 
   private normalizeQuotationForResponse(quotation: unknown) {
-    if (!quotation || typeof quotation !== 'object' || Array.isArray(quotation)) {
+    if (
+      !quotation ||
+      typeof quotation !== 'object' ||
+      Array.isArray(quotation)
+    ) {
       return quotation;
     }
 
@@ -975,9 +648,11 @@ export class AppService {
 
   private hasCatalogData(value: unknown): boolean {
     if (value === null || value === undefined || value === '') return false;
-    if (typeof value === 'string') return this.cleanCatalogText(value).length > 0;
+    if (typeof value === 'string')
+      return this.cleanCatalogText(value).length > 0;
     if (typeof value === 'number' || typeof value === 'boolean') return true;
-    if (Array.isArray(value)) return value.some((item) => this.hasCatalogData(item));
+    if (Array.isArray(value))
+      return value.some((item) => this.hasCatalogData(item));
     if (typeof value === 'object') {
       return Object.values(value as Record<string, unknown>).some((item) =>
         this.hasCatalogData(item),
@@ -989,7 +664,12 @@ export class AppService {
   private isSkuOnlyProductName(name: string, aliases: string[]) {
     const normalizedName = this.cleanCatalogText(name).toLowerCase();
     if (!normalizedName) return true;
-    if (aliases.some((alias) => this.cleanCatalogText(alias).toLowerCase() === normalizedName)) {
+    if (
+      aliases.some(
+        (alias) =>
+          this.cleanCatalogText(alias).toLowerCase() === normalizedName,
+      )
+    ) {
       return true;
     }
     if (/^\d+([_\-\s]\d+)*$/.test(normalizedName)) {
@@ -1007,11 +687,7 @@ export class AppService {
       return false;
     }
 
-    const knownCategoryLabels = new Set([
-      'hydromax',
-      'pant+pands',
-      'pants',
-    ]);
+    const knownCategoryLabels = new Set(['hydromax', 'pant+pands', 'pants']);
     if (knownCategoryLabels.has(normalizedName)) {
       return false;
     }
@@ -1206,7 +882,9 @@ export class AppService {
     const stores = await this.prisma.store.findMany({
       select: { id: true, name: true },
     });
-    const storeNameById = new Map(stores.map((store) => [store.id, store.name]));
+    const storeNameById = new Map(
+      stores.map((store) => [store.id, store.name]),
+    );
     const payments = await this.prisma.walletTransaction.findMany({
       orderBy: { createdAt: 'desc' },
       take: 500,
@@ -1232,7 +910,9 @@ export class AppService {
       ],
       rows: payments.map((payment) => ({
         date: this.formatDateValue(payment.transactionDate),
-        store: payment.storeId ? storeNameById.get(payment.storeId) ?? '-' : '-',
+        store: payment.storeId
+          ? (storeNameById.get(payment.storeId) ?? '-')
+          : '-',
         type: this.formatLabel(payment.transactionType),
         invoice: payment.invoiceReference ?? '-',
         amount: this.round(payment.amount),
@@ -1244,7 +924,9 @@ export class AppService {
     };
   }
 
-  private groupBySeverity(rows: Array<{ severity?: string | null }>): ChartPoint[] {
+  private groupBySeverity(
+    rows: Array<{ severity?: string | null }>,
+  ): ChartPoint[] {
     const groups = rows.reduce<Record<string, number>>((totals, row) => {
       const label = this.formatLabel(row.severity || 'unknown');
       totals[label] = (totals[label] ?? 0) + 1;
@@ -1272,7 +954,8 @@ export class AppService {
   private normalizeDashboardFilters(filters: DashboardFilters) {
     return Object.fromEntries(
       Object.entries(filters).map(([key, value]) => {
-        const normalizedValue = typeof value === 'string' ? value.trim() : value;
+        const normalizedValue =
+          typeof value === 'string' ? value.trim() : value;
         return [
           key,
           this.isAllFilterValue(key, normalizedValue) ? '' : normalizedValue,
@@ -1368,7 +1051,10 @@ export class AppService {
     return [
       ...new Set(
         values
-          .filter((value): value is string | number => value !== null && value !== undefined)
+          .filter(
+            (value): value is string | number =>
+              value !== null && value !== undefined,
+          )
           .map(String)
           .filter(Boolean),
       ),
@@ -1404,60 +1090,8 @@ export class AppService {
   private round(value: number) {
     return Number(value.toFixed(2));
   }
-
-  private isInDateRange(value: string | Date | null | undefined, filters: DashboardFilters) {
-    if (!value || (!filters.dateFrom && !filters.dateTo)) return true;
-    const time = new Date(value).getTime();
-    if (Number.isNaN(time)) return true;
-    if (filters.dateFrom && time < new Date(filters.dateFrom).getTime()) return false;
-    if (filters.dateTo && time > new Date(filters.dateTo).getTime()) return false;
-    return true;
-  }
-
-  private groupLocalOrdersByDate(orders: Array<{ orderDate?: string | Date | null }>) {
-    return this.groupRecordsByDate(
-      orders.map((order) => ({
-        date: order.orderDate ? new Date(order.orderDate) : null,
-      })),
-    );
-  }
-
-  private groupLocalCostsByDate(
-    lines: Array<{ totalCost: number; order: { orderDate?: string | Date | null } }>,
-  ) {
-    const grouped = lines.reduce<Record<string, number>>((totals, line) => {
-      if (!line.order.orderDate) return totals;
-      const label = new Date(line.order.orderDate).toISOString().slice(0, 10);
-      totals[label] = (totals[label] ?? 0) + line.totalCost;
-      return totals;
-    }, {});
-
-    return Object.entries(grouped)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([label, total]) => ({ label, total: this.round(total) }))
-      .slice(-30);
-  }
-
-  private groupLocalCostsByStore(
-    lines: Array<{ totalCost: number; order: { storeName: string } }>,
-  ) {
-    const grouped = lines.reduce<Record<string, number>>((totals, line) => {
-      const label = line.order.storeName;
-      totals[label] = (totals[label] ?? 0) + line.totalCost;
-      return totals;
-    }, {});
-
-    return Object.entries(grouped)
-      .map(([label, total]) => ({ label, total: this.round(total) }))
-      .sort((first, second) => second.total - first.total)
-      .slice(0, 12);
-  }
 }
 
 function sameText(left: string, right: string) {
   return left.trim().toLowerCase() === right.trim().toLowerCase();
-}
-
-function isBrandOwnerName(name: string | undefined) {
-  return (name ?? '').trim().toLowerCase() === 'marcus';
 }

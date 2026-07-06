@@ -106,7 +106,11 @@ export class ExcelImportService {
       );
     });
 
-    return this.preview({ originalname: safeName, buffer, size: buffer.length });
+    return this.preview({
+      originalname: safeName,
+      buffer,
+      size: buffer.length,
+    });
   }
 
   async confirm(token: string) {
@@ -136,7 +140,9 @@ export class ExcelImportService {
       });
 
       if (existingBatch) {
-        throw new BadRequestException('This exact Excel file was already imported.');
+        throw new BadRequestException(
+          'This exact Excel file was already imported.',
+        );
       }
     } catch (error) {
       this.throwConfirmImportError(error);
@@ -147,235 +153,237 @@ export class ExcelImportService {
     try {
       result = await this.prisma.$transaction(
         async (tx) => {
-        const batch = await tx.importBatch.create({
-          data: {
-            fileName: entry.parsed.fileName,
-            fileHash: entry.parsed.fileHash,
-            summary: this.previewSummary(entry.preview),
-            warnings: entry.parsed.warnings,
-            duplicates: entry.preview.duplicateRecords,
-          },
-        });
-
-      const brandName = entry.parsed.brandName || 'TanjAI';
-      const brand = await tx.brand.upsert({
-        where: { name: brandName },
-        update: {},
-        create: { name: brandName },
-      });
-
-      const storeIds = new Map<string, string>();
-      for (const store of entry.parsed.stores) {
-        const saved = await tx.store.upsert({
-          where: {
-            brandId_normalizedName: {
-              brandId: brand.id,
-              normalizedName: store.normalizedName,
+          const batch = await tx.importBatch.create({
+            data: {
+              fileName: entry.parsed.fileName,
+              fileHash: entry.parsed.fileHash,
+              summary: this.previewSummary(entry.preview),
+              warnings: entry.parsed.warnings,
+              duplicates: entry.preview.duplicateRecords,
             },
-          },
-          update: {
-            name: store.name,
-            country: store.country,
-            platform: store.platform,
-          },
-          create: {
-            brandId: brand.id,
-            name: store.name,
-            normalizedName: store.normalizedName,
-            country: store.country,
-            platform: store.platform,
-          },
-        });
-        storeIds.set(store.name, saved.id);
-        storeIds.set(store.normalizedName, saved.id);
-      }
+          });
 
-      const { productIds, skuProductIds } = await this.resolveImportedProducts(
-        tx,
-        entry.parsed.products,
-        storeIds,
-      );
+          const brandName = entry.parsed.brandName || 'TanjAI';
+          const brand = await tx.brand.upsert({
+            where: { name: brandName },
+            update: {},
+            create: { name: brandName },
+          });
 
-      await this.createManyInChunks(
-        tx.fulfillmentInvoice,
-        entry.parsed.invoices.map((invoice) => {
-          const storeId = this.requireStoreId(storeIds, invoice.storeName);
-          return {
-            importBatchId: batch.id,
-            storeId,
-            invoiceReference: invoice.invoiceReference,
-            invoiceDate: invoice.invoiceDate,
-            subtotal: invoice.subtotal,
-            refunds: invoice.refunds,
-            adjustments: invoice.adjustments,
-            otherCost: invoice.otherCost,
-            total: invoice.total,
-            sourceSheet: invoice.sourceSheet,
-            sourceRow: invoice.sourceRow,
-          };
-        }),
-        true,
-      );
-
-      const orderRecords = entry.parsed.orders.map((order) => {
-        const storeId = this.requireStoreId(storeIds, order.storeName);
-        return {
-          id: randomUUID(),
-          order,
-          data: {
-            importBatchId: batch.id,
-            storeId,
-            externalOrderNumber: order.externalOrderNumber,
-            orderDate: order.orderDate,
-            invoiceReference: order.invoiceReference,
-            status: order.status,
-            sourceSheet: order.sourceSheet,
-            sourceRow: order.sourceRow,
-          },
-        };
-      });
-
-      await this.createManyInChunks(
-        tx.order,
-        orderRecords.map((record) => ({
-          id: record.id,
-          ...record.data,
-        })),
-        true,
-      );
-
-      const persistedOrderIds = new Set<string>();
-      for (const chunk of this.chunk(
-        orderRecords.map((record) => record.id),
-        1000,
-      )) {
-        const rows = await tx.order.findMany({
-          where: { id: { in: chunk } },
-          select: { id: true },
-        });
-        for (const row of rows) {
-          persistedOrderIds.add(row.id);
-        }
-      }
-
-      const shipmentRows: Array<Record<string, unknown>> = [];
-      const orderLineRows: Array<Record<string, unknown>> = [];
-
-      for (const { id: orderId, order } of orderRecords) {
-        if (!persistedOrderIds.has(orderId)) {
-          continue;
-        }
-
-        const seenTracking = new Set<string>();
-        for (const shipment of order.shipments) {
-          if (seenTracking.has(shipment.trackingNumber)) {
-            continue;
+          const storeIds = new Map<string, string>();
+          for (const store of entry.parsed.stores) {
+            const saved = await tx.store.upsert({
+              where: {
+                brandId_normalizedName: {
+                  brandId: brand.id,
+                  normalizedName: store.normalizedName,
+                },
+              },
+              update: {
+                name: store.name,
+                country: store.country,
+                platform: store.platform,
+              },
+              create: {
+                brandId: brand.id,
+                name: store.name,
+                normalizedName: store.normalizedName,
+                country: store.country,
+                platform: store.platform,
+              },
+            });
+            storeIds.set(store.name, saved.id);
+            storeIds.set(store.normalizedName, saved.id);
           }
-          seenTracking.add(shipment.trackingNumber);
-          shipmentRows.push({
-            orderId,
-            trackingNumber: shipment.trackingNumber,
-            sourceSheet: shipment.sourceSheet,
-            sourceRow: shipment.sourceRow,
+
+          const { productIds, skuProductIds } =
+            await this.resolveImportedProducts(
+              tx,
+              entry.parsed.products,
+              storeIds,
+            );
+
+          await this.createManyInChunks(
+            tx.fulfillmentInvoice,
+            entry.parsed.invoices.map((invoice) => {
+              const storeId = this.requireStoreId(storeIds, invoice.storeName);
+              return {
+                importBatchId: batch.id,
+                storeId,
+                invoiceReference: invoice.invoiceReference,
+                invoiceDate: invoice.invoiceDate,
+                subtotal: invoice.subtotal,
+                refunds: invoice.refunds,
+                adjustments: invoice.adjustments,
+                otherCost: invoice.otherCost,
+                total: invoice.total,
+                sourceSheet: invoice.sourceSheet,
+                sourceRow: invoice.sourceRow,
+              };
+            }),
+            true,
+          );
+
+          const orderRecords = entry.parsed.orders.map((order) => {
+            const storeId = this.requireStoreId(storeIds, order.storeName);
+            return {
+              id: randomUUID(),
+              order,
+              data: {
+                importBatchId: batch.id,
+                storeId,
+                externalOrderNumber: order.externalOrderNumber,
+                orderDate: order.orderDate,
+                invoiceReference: order.invoiceReference,
+                status: order.status,
+                sourceSheet: order.sourceSheet,
+                sourceRow: order.sourceRow,
+              },
+            };
           });
-        }
 
-        for (const line of order.lines) {
-          orderLineRows.push({
-            orderId,
-            productId: skuProductIds.get(line.sku),
-            sku: line.sku,
-            quantity: line.quantity,
-            productCost: line.productCost,
-            shippingCost: line.shippingCost,
-            handlingCost: line.handlingCost,
-            totalCost: line.totalCost,
-            lineType: line.lineType,
-            sourceSheet: line.sourceSheet,
-            sourceRow: line.sourceRow,
-          });
-        }
-      }
+          await this.createManyInChunks(
+            tx.order,
+            orderRecords.map((record) => ({
+              id: record.id,
+              ...record.data,
+            })),
+            true,
+          );
 
-      await this.createManyInChunks(tx.shipment, shipmentRows, true);
-      await this.createManyInChunks(tx.orderLine, orderLineRows);
+          const persistedOrderIds = new Set<string>();
+          for (const chunk of this.chunk(
+            orderRecords.map((record) => record.id),
+            1000,
+          )) {
+            const rows = await tx.order.findMany({
+              where: { id: { in: chunk } },
+              select: { id: true },
+            });
+            for (const row of rows) {
+              persistedOrderIds.add(row.id);
+            }
+          }
 
-      await this.createManyInChunks(
-        tx.stockPurchase,
-        entry.parsed.stockPurchases.map((purchase) => ({
-            importBatchId: batch.id,
-            productId: purchase.productName
-              ? this.lookupProductId(productIds, purchase.productName)
-              : purchase.sku
-                ? skuProductIds.get(purchase.sku)
+          const shipmentRows: Array<Record<string, unknown>> = [];
+          const orderLineRows: Array<Record<string, unknown>> = [];
+
+          for (const { id: orderId, order } of orderRecords) {
+            if (!persistedOrderIds.has(orderId)) {
+              continue;
+            }
+
+            const seenTracking = new Set<string>();
+            for (const shipment of order.shipments) {
+              if (seenTracking.has(shipment.trackingNumber)) {
+                continue;
+              }
+              seenTracking.add(shipment.trackingNumber);
+              shipmentRows.push({
+                orderId,
+                trackingNumber: shipment.trackingNumber,
+                sourceSheet: shipment.sourceSheet,
+                sourceRow: shipment.sourceRow,
+              });
+            }
+
+            for (const line of order.lines) {
+              orderLineRows.push({
+                orderId,
+                productId: this.lookupSkuProductId(skuProductIds, line.sku),
+                sku: line.sku,
+                quantity: line.quantity,
+                productCost: line.productCost,
+                shippingCost: line.shippingCost,
+                handlingCost: line.handlingCost,
+                totalCost: line.totalCost,
+                lineType: line.lineType,
+                sourceSheet: line.sourceSheet,
+                sourceRow: line.sourceRow,
+              });
+            }
+          }
+
+          await this.createManyInChunks(tx.shipment, shipmentRows, true);
+          await this.createManyInChunks(tx.orderLine, orderLineRows);
+
+          await this.createManyInChunks(
+            tx.stockPurchase,
+            entry.parsed.stockPurchases.map((purchase) => ({
+              importBatchId: batch.id,
+              productId: purchase.productName
+                ? this.lookupProductId(productIds, purchase.productName)
+                : purchase.sku
+                  ? this.lookupSkuProductId(skuProductIds, purchase.sku)
+                  : undefined,
+              purchaseDate: purchase.purchaseDate,
+              sku: purchase.sku,
+              quantity: purchase.quantity,
+              unitCost: purchase.unitCost,
+              totalCost: purchase.totalCost,
+              sourceSheet: purchase.sourceSheet,
+              sourceRow: purchase.sourceRow,
+            })),
+          );
+
+          await this.createManyInChunks(
+            tx.inventoryMovement,
+            entry.parsed.inventoryMovements.map((movement) => ({
+              importBatchId: batch.id,
+              productId: movement.productName
+                ? this.lookupProductId(productIds, movement.productName)
                 : undefined,
-            purchaseDate: purchase.purchaseDate,
-            sku: purchase.sku,
-            quantity: purchase.quantity,
-            unitCost: purchase.unitCost,
-            totalCost: purchase.totalCost,
-            sourceSheet: purchase.sourceSheet,
-            sourceRow: purchase.sourceRow,
-        })),
-      );
+              storeId: movement.storeName
+                ? this.lookupStoreId(storeIds, movement.storeName)
+                : undefined,
+              movementDate: movement.movementDate,
+              movementType: movement.movementType,
+              quantity: movement.quantity,
+              reference: movement.reference,
+              comment: movement.comment,
+              sourceSheet: movement.sourceSheet,
+              sourceRow: movement.sourceRow,
+            })),
+          );
 
-      await this.createManyInChunks(
-        tx.inventoryMovement,
-        entry.parsed.inventoryMovements.map((movement) => ({
-            importBatchId: batch.id,
-            productId: movement.productName
-              ? this.lookupProductId(productIds, movement.productName)
-              : undefined,
-            storeId: movement.storeName
-              ? this.lookupStoreId(storeIds, movement.storeName)
-              : undefined,
-            movementDate: movement.movementDate,
-            movementType: movement.movementType,
-            quantity: movement.quantity,
-            reference: movement.reference,
-            comment: movement.comment,
-            sourceSheet: movement.sourceSheet,
-            sourceRow: movement.sourceRow,
-        })),
-      );
+          await this.createManyInChunks(
+            tx.walletTransaction,
+            entry.parsed.walletTransactions.map((transaction) => ({
+              importBatchId: batch.id,
+              storeId: transaction.storeName
+                ? this.lookupStoreId(storeIds, transaction.storeName)
+                : undefined,
+              transactionDate: transaction.transactionDate,
+              transactionType: transaction.transactionType,
+              invoiceReference: transaction.invoiceReference,
+              amount: transaction.amount,
+              runningBalance: transaction.runningBalance,
+              exchangeRate: transaction.exchangeRate,
+              sourceSheet: transaction.sourceSheet,
+              sourceRow: transaction.sourceRow,
+            })),
+          );
 
-      await this.createManyInChunks(
-        tx.walletTransaction,
-        entry.parsed.walletTransactions.map((transaction) => ({
-            importBatchId: batch.id,
-            storeId: transaction.storeName
-              ? this.lookupStoreId(storeIds, transaction.storeName)
-              : undefined,
-            transactionDate: transaction.transactionDate,
-            transactionType: transaction.transactionType,
-            invoiceReference: transaction.invoiceReference,
-            amount: transaction.amount,
-            runningBalance: transaction.runningBalance,
-            sourceSheet: transaction.sourceSheet,
-            sourceRow: transaction.sourceRow,
-        })),
-      );
+          await this.createManyInChunks(
+            tx.anomaly,
+            entry.parsed.warnings
+              .filter((item) => item.severity !== 'info')
+              .map((warning) => ({
+                importBatchId: batch.id,
+                severity: warning.severity,
+                message: warning.message,
+                sourceSheet: warning.sourceSheet,
+                sourceRow: warning.sourceRow,
+              })),
+          );
 
-      await this.createManyInChunks(
-        tx.anomaly,
-        entry.parsed.warnings
-          .filter((item) => item.severity !== 'info')
-          .map((warning) => ({
-            importBatchId: batch.id,
-            severity: warning.severity,
-            message: warning.message,
-            sourceSheet: warning.sourceSheet,
-            sourceRow: warning.sourceRow,
-          })),
+          return { importBatchId: batch.id, summary: entry.preview };
+        },
+        {
+          maxWait: 20000,
+          timeout: 300000,
+        },
       );
-
-        return { importBatchId: batch.id, summary: entry.preview };
-      },
-      {
-        maxWait: 20000,
-        timeout: 300000,
-      },
-    );
     } catch (error) {
       this.throwConfirmImportError(error);
     }
@@ -411,60 +419,64 @@ export class ExcelImportService {
 
       const result = await this.prisma.$transaction(
         async (tx) => {
-        const orderIds = (
-          await tx.order.findMany({
-            where: { importBatchId },
-            select: { id: true },
-          })
-        ).map((order) => order.id);
+          const orderIds = (
+            await tx.order.findMany({
+              where: { importBatchId },
+              select: { id: true },
+            })
+          ).map((order) => order.id);
 
-        if (orderIds.length > 0) {
-          await tx.shipment.deleteMany({ where: { orderId: { in: orderIds } } });
-          await tx.orderLine.deleteMany({ where: { orderId: { in: orderIds } } });
-        }
+          if (orderIds.length > 0) {
+            await tx.shipment.deleteMany({
+              where: { orderId: { in: orderIds } },
+            });
+            await tx.orderLine.deleteMany({
+              where: { orderId: { in: orderIds } },
+            });
+          }
 
-        const [
-          deletedAnomalies,
-          deletedWalletTransactions,
-          deletedInventoryMovements,
-          deletedStockPurchases,
-          deletedInvoices,
-          deletedOrders,
-        ] = await Promise.all([
-          tx.anomaly.deleteMany({ where: { importBatchId } }),
-          tx.walletTransaction.deleteMany({ where: { importBatchId } }),
-          tx.inventoryMovement.deleteMany({ where: { importBatchId } }),
-          tx.stockPurchase.deleteMany({ where: { importBatchId } }),
-          tx.fulfillmentInvoice.deleteMany({ where: { importBatchId } }),
-          tx.order.deleteMany({ where: { importBatchId } }),
-        ]);
+          const [
+            deletedAnomalies,
+            deletedWalletTransactions,
+            deletedInventoryMovements,
+            deletedStockPurchases,
+            deletedInvoices,
+            deletedOrders,
+          ] = await Promise.all([
+            tx.anomaly.deleteMany({ where: { importBatchId } }),
+            tx.walletTransaction.deleteMany({ where: { importBatchId } }),
+            tx.inventoryMovement.deleteMany({ where: { importBatchId } }),
+            tx.stockPurchase.deleteMany({ where: { importBatchId } }),
+            tx.fulfillmentInvoice.deleteMany({ where: { importBatchId } }),
+            tx.order.deleteMany({ where: { importBatchId } }),
+          ]);
 
-        const deletedImportBatch = await tx.importBatch.delete({
-          where: { id: importBatchId },
-          select: { id: true, fileHash: true },
-        });
-        const remainingImportBatches = await tx.importBatch.count();
-        const orphanProducts = await this.cleanupOrphanProducts(
-          tx,
-          remainingImportBatches,
-        );
+          const deletedImportBatch = await tx.importBatch.delete({
+            where: { id: importBatchId },
+            select: { id: true, fileHash: true },
+          });
+          const remainingImportBatches = await tx.importBatch.count();
+          const orphanProducts = await this.cleanupOrphanProducts(
+            tx,
+            remainingImportBatches,
+          );
 
-        return {
-          importBatchId,
-          fileName: existingBatch.fileName,
-          removedFileHash: deletedImportBatch.fileHash,
-          deleted: {
-            importBatches: 1,
-            orders: deletedOrders.count,
-            invoices: deletedInvoices.count,
-            stockPurchases: deletedStockPurchases.count,
-            inventoryMovements: deletedInventoryMovements.count,
-            walletTransactions: deletedWalletTransactions.count,
-            anomalies: deletedAnomalies.count,
-            orphanProducts: orphanProducts.products,
-            orphanSkuAliases: orphanProducts.aliases,
-          },
-        };
+          return {
+            importBatchId,
+            fileName: existingBatch.fileName,
+            removedFileHash: deletedImportBatch.fileHash,
+            deleted: {
+              importBatches: 1,
+              orders: deletedOrders.count,
+              invoices: deletedInvoices.count,
+              stockPurchases: deletedStockPurchases.count,
+              inventoryMovements: deletedInventoryMovements.count,
+              walletTransactions: deletedWalletTransactions.count,
+              anomalies: deletedAnomalies.count,
+              orphanProducts: orphanProducts.products,
+              orphanSkuAliases: orphanProducts.aliases,
+            },
+          };
         },
         {
           maxWait: 20000,
@@ -517,12 +529,14 @@ export class ExcelImportService {
         const stockPurchaseCount = await this.prisma.stockPurchase.count({
           where: { importBatchId: batch.id },
         });
-        const inventoryMovementCount = await this.prisma.inventoryMovement.count({
-          where: { importBatchId: batch.id },
-        });
-        const walletTransactionCount = await this.prisma.walletTransaction.count({
-          where: { importBatchId: batch.id },
-        });
+        const inventoryMovementCount =
+          await this.prisma.inventoryMovement.count({
+            where: { importBatchId: batch.id },
+          });
+        const walletTransactionCount =
+          await this.prisma.walletTransaction.count({
+            where: { importBatchId: batch.id },
+          });
         const anomalyCount = await this.prisma.anomaly.count({
           where: { importBatchId: batch.id },
         });
@@ -602,7 +616,14 @@ export class ExcelImportService {
     const productIds = new Map<string, string>();
     const skuProductIds = new Map<string, string>();
     const productRows = await tx.product.findMany({
-      select: { id: true, name: true, description: true, weight: true, quotation: true, imageUrl: true },
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        weight: true,
+        quotation: true,
+        imageUrl: true,
+      },
     });
     const aliasRows = await tx.productSkuAlias.findMany({
       select: {
@@ -610,11 +631,20 @@ export class ExcelImportService {
         storeId: true,
         productId: true,
         product: {
-          select: { id: true, name: true, description: true, weight: true, quotation: true, imageUrl: true },
+          select: {
+            id: true,
+            name: true,
+            description: true,
+            weight: true,
+            quotation: true,
+            imageUrl: true,
+          },
         },
       },
     });
-    const productsById = new Map(productRows.map((product) => [product.id, product]));
+    const productsById = new Map(
+      productRows.map((product) => [product.id, product]),
+    );
     const productsByName = new Map<string, any>();
     const aliasesBySku = new Map<string, any>();
 
@@ -628,7 +658,7 @@ export class ExcelImportService {
 
     for (const alias of aliasRows) {
       aliasesBySku.set(alias.sku, alias);
-      skuProductIds.set(alias.sku, alias.productId);
+      this.rememberSkuProductId(skuProductIds, alias.sku, alias.productId);
       this.rememberProductId(productIds, alias.sku, alias.productId);
     }
 
@@ -639,16 +669,26 @@ export class ExcelImportService {
     for (const product of orderedProducts) {
       const sku = product.sku ? cleanText(product.sku) : '';
       const normalizedName = normalizeProductName(product.name);
-      const existingAlias = sku ? aliasesBySku.get(sku) : null;
+      const existingAlias = sku
+        ? (aliasesBySku.get(sku) ?? aliasesBySku.get(canonicalSkuKey(sku)))
+        : null;
       let saved = existingAlias?.product ?? productsByName.get(normalizedName);
 
-      if (existingAlias?.product && this.shouldPromoteFallbackProduct(existingAlias.product, product)) {
+      if (
+        existingAlias?.product &&
+        this.shouldPromoteFallbackProduct(existingAlias.product, product)
+      ) {
         const nameMatch = productsByName.get(normalizedName);
         if (nameMatch && nameMatch.id !== existingAlias.productId) {
           await this.mergeProduct(tx, existingAlias.productId, nameMatch.id);
           saved = await this.updateProductMetadata(tx, nameMatch.id, product);
         } else {
-          saved = await this.updateProductMetadata(tx, existingAlias.productId, product, true);
+          saved = await this.updateProductMetadata(
+            tx,
+            existingAlias.productId,
+            product,
+            true,
+          );
         }
       } else if (saved) {
         saved = await this.updateProductMetadata(tx, saved.id, product);
@@ -670,7 +710,7 @@ export class ExcelImportService {
 
       if (sku) {
         this.rememberProductId(productIds, sku, saved.id);
-        skuProductIds.set(sku, saved.id);
+        this.rememberSkuProductId(skuProductIds, sku, saved.id);
         const storeId = product.storeName
           ? this.lookupStoreId(storeIds, product.storeName)
           : undefined;
@@ -695,6 +735,12 @@ export class ExcelImportService {
           productId: saved.id,
           product: saved,
         });
+        aliasesBySku.set(canonicalSkuKey(sku), {
+          sku,
+          storeId: aliasStoreId,
+          productId: saved.id,
+          product: saved,
+        });
       }
     }
 
@@ -713,7 +759,9 @@ export class ExcelImportService {
   ) {
     if (product.source !== 'quotation') return false;
     if (!product.sku) return false;
-    return normalizeProductName(existing.name) === normalizeProductName(product.sku);
+    return (
+      normalizeProductName(existing.name) === normalizeProductName(product.sku)
+    );
   }
 
   private async updateProductMetadata(
@@ -739,7 +787,11 @@ export class ExcelImportService {
     });
   }
 
-  private async mergeProduct(tx: any, sourceProductId: string, targetProductId: string) {
+  private async mergeProduct(
+    tx: any,
+    sourceProductId: string,
+    targetProductId: string,
+  ) {
     if (sourceProductId === targetProductId) return;
 
     await tx.orderLine.updateMany({
@@ -758,7 +810,9 @@ export class ExcelImportService {
       where: { productId: sourceProductId },
       data: { productId: targetProductId },
     });
-    await tx.product.delete({ where: { id: sourceProductId } }).catch(() => undefined);
+    await tx.product
+      .delete({ where: { id: sourceProductId } })
+      .catch(() => undefined);
   }
 
   private async cleanupOrphanProducts(tx: any, remainingImportBatches: number) {
@@ -780,8 +834,7 @@ export class ExcelImportService {
     const orphanProducts = orphanCandidates.filter((product) => {
       if (remainingImportBatches === 0) return true;
       return (
-        product._count.skuAliases === 0 &&
-        !hasActiveProductDetails(product)
+        product._count.skuAliases === 0 && !hasActiveProductDetails(product)
       );
     });
     const productIds = orphanProducts.map((product) => product.id);
@@ -808,11 +861,40 @@ export class ExcelImportService {
     if (!nameOrSku) return;
     productIds.set(nameOrSku, productId);
     productIds.set(normalizeProductName(nameOrSku), productId);
+    const canonicalSku = canonicalSkuKey(nameOrSku);
+    productIds.set(canonicalSku, productId);
+    productIds.set(normalizeProductName(canonicalSku), productId);
   }
 
-  private lookupProductId(productIds: Map<string, string>, nameOrSku: string | undefined) {
+  private lookupProductId(
+    productIds: Map<string, string>,
+    nameOrSku: string | undefined,
+  ) {
     if (!nameOrSku) return undefined;
-    return productIds.get(nameOrSku) ?? productIds.get(normalizeProductName(nameOrSku));
+    const canonicalSku = canonicalSkuKey(nameOrSku);
+    return (
+      productIds.get(nameOrSku) ??
+      productIds.get(normalizeProductName(nameOrSku)) ??
+      productIds.get(canonicalSku) ??
+      productIds.get(normalizeProductName(canonicalSku))
+    );
+  }
+
+  private rememberSkuProductId(
+    skuProductIds: Map<string, string>,
+    sku: string,
+    productId: string,
+  ) {
+    skuProductIds.set(sku, productId);
+    skuProductIds.set(canonicalSkuKey(sku), productId);
+  }
+
+  private lookupSkuProductId(
+    skuProductIds: Map<string, string>,
+    sku: string | undefined,
+  ) {
+    if (!sku) return undefined;
+    return skuProductIds.get(sku) ?? skuProductIds.get(canonicalSkuKey(sku));
   }
 
   private async createManyInChunks(
@@ -850,7 +932,10 @@ export class ExcelImportService {
   }
 
   private throwConfirmImportError(error: unknown): never {
-    if (error instanceof BadRequestException || error instanceof NotFoundException) {
+    if (
+      error instanceof BadRequestException ||
+      error instanceof NotFoundException
+    ) {
       throw error;
     }
 
@@ -859,7 +944,10 @@ export class ExcelImportService {
         ? `${error.message} ${JSON.stringify((error as { code?: string; meta?: unknown }).meta ?? {})}`
         : String(error);
 
-    if (details.includes('P2028') || details.includes('Transaction not found')) {
+    if (
+      details.includes('P2028') ||
+      details.includes('Transaction not found')
+    ) {
       throw new BadRequestException(
         'Cannot confirm import because Prisma lost the database transaction. Use the Supabase session pooler URL ending in :5432, or the direct connection URL if your network supports IPv6 or your project has the IPv4 add-on. Restart the backend, preview the file again, and confirm.',
       );
@@ -927,6 +1015,7 @@ export class ExcelImportService {
 
     const storeNames = new Set<string>();
     const productKeys = new Set<string>();
+    const skuDecoderSheets: WorkbookSheet[] = [];
 
     for (const sheet of workbook.sheets) {
       const type = this.detectSheetType(sheet);
@@ -934,9 +1023,14 @@ export class ExcelImportService {
 
       if (type === 'quotation') {
         this.parseQuotation(sheet, parsed, productKeys);
+      } else if (type === 'sku_decoder') {
+        skuDecoderSheets.push(sheet);
       } else if (type === 'store_orders') {
         const store = this.toStore(sheet.name);
-        if (!this.isBrandOwnerName(sheet.name) && !storeNames.has(store.normalizedName)) {
+        if (
+          !this.isBrandOwnerName(sheet.name) &&
+          !storeNames.has(store.normalizedName)
+        ) {
           parsed.stores.push(store);
           storeNames.add(store.normalizedName);
         }
@@ -957,14 +1051,23 @@ export class ExcelImportService {
       });
     }
 
+    for (const sheet of skuDecoderSheets) {
+      this.parseSkuDecoder(sheet, parsed, productKeys);
+    }
+
     this.addParsedImportWarnings(parsed);
 
     return parsed;
   }
 
   private addParsedImportWarnings(parsed: ParsedImport) {
-    const knownStores = new Set(parsed.stores.map((store) => store.normalizedName));
-    const warnUnknownStore = (storeName: string | undefined, source: SourceRef) => {
+    const knownStores = new Set(
+      parsed.stores.map((store) => store.normalizedName),
+    );
+    const warnUnknownStore = (
+      storeName: string | undefined,
+      source: SourceRef,
+    ) => {
       if (!storeName || this.isBrandOwnerName(storeName)) return;
       if (knownStores.has(normalizeStoreName(storeName))) return;
       parsed.warnings.push({
@@ -976,7 +1079,8 @@ export class ExcelImportService {
     };
 
     for (const order of parsed.orders) warnUnknownStore(order.storeName, order);
-    for (const invoice of parsed.invoices) warnUnknownStore(invoice.storeName, invoice);
+    for (const invoice of parsed.invoices)
+      warnUnknownStore(invoice.storeName, invoice);
     for (const transaction of parsed.walletTransactions) {
       warnUnknownStore(transaction.storeName, transaction);
     }
@@ -987,14 +1091,19 @@ export class ExcelImportService {
     const quotationSkus = new Set(
       parsed.products
         .filter((product) => product.source === 'quotation' && product.sku)
-        .map((product) => product.sku as string),
+        .flatMap((product) => {
+          const sku = product.sku as string;
+          return [sku, canonicalSkuKey(sku)];
+        }),
     );
     const unmatchedFallbacks = parsed.products.filter((product) => {
       return (
         product.source === 'fallback' &&
         product.sku &&
-        normalizeProductName(product.name) === normalizeProductName(product.sku) &&
-        !quotationSkus.has(product.sku)
+        normalizeProductName(product.name) ===
+          normalizeProductName(product.sku) &&
+        !quotationSkus.has(product.sku) &&
+        !quotationSkus.has(canonicalSkuKey(product.sku))
       );
     });
 
@@ -1024,6 +1133,7 @@ export class ExcelImportService {
       .join(' ');
 
     if (name.includes('quotation')) return 'quotation';
+    if (name.includes('sku decoder')) return 'sku_decoder';
     if (name.includes('payment') && name.includes('balance')) {
       return 'payment_balance';
     }
@@ -1068,7 +1178,9 @@ export class ExcelImportService {
       const hasUsefulQuotation = hasUsefulQuotationData(quotation);
       const name =
         nameInfo.name ||
-        ((skus.length === 0 || !rawName) && lastProductName ? lastProductName : '') ||
+        ((skus.length === 0 || !rawName) && lastProductName
+          ? lastProductName
+          : '') ||
         skus[0] ||
         '';
       const rowImageUrl = imageByRow.get(row.rowNumber);
@@ -1112,7 +1224,10 @@ export class ExcelImportService {
 
       for (const sku of skus) {
         const existingName = seenSkuNames.get(sku);
-        if (existingName && normalizeProductName(existingName) !== normalizeProductName(name)) {
+        if (
+          existingName &&
+          normalizeProductName(existingName) !== normalizeProductName(name)
+        ) {
           parsed.warnings.push({
             sourceSheet: sheet.name,
             sourceRow: row.rowNumber,
@@ -1143,6 +1258,57 @@ export class ExcelImportService {
         });
       }
     }
+  }
+
+  private parseSkuDecoder(
+    sheet: WorkbookSheet,
+    parsed: ParsedImport,
+    productKeys: Set<string>,
+  ) {
+    for (const row of sheet.rows) {
+      const sku = cleanText(row.cells[1]);
+      const productText = cleanText(row.cells[2]);
+
+      if (!sku || !productText || !isDecoderSkuCode(sku)) {
+        continue;
+      }
+
+      const product = this.findDecodedProduct(parsed.products, productText);
+      if (!product) {
+        parsed.warnings.push({
+          sourceSheet: sheet.name,
+          sourceRow: row.rowNumber,
+          severity: 'warning',
+          message: `SKU decoder alias ${sku} did not match a quotation product.`,
+        });
+        continue;
+      }
+
+      this.addProduct(parsed, productKeys, {
+        name: product.name,
+        description: product.description,
+        weight: product.weight,
+        sku,
+        imageUrl: product.imageUrl,
+        quotation: product.quotation,
+        source: 'quotation',
+      });
+    }
+  }
+
+  private findDecodedProduct(products: ParsedProduct[], productText: string) {
+    const haystack = normalizeDecoderText(productText);
+    return products.find((product) => {
+      if (product.source !== 'quotation') return false;
+      const candidates = [product.sku, product.name, product.description]
+        .map((value) => normalizeDecoderText(value))
+        .filter((value) => value.length >= 4);
+
+      return candidates.some(
+        (candidate) =>
+          haystack.includes(candidate) || candidate.includes(haystack),
+      );
+    });
   }
 
   private quotationImagesByRow(images: WorkbookImage[]) {
@@ -1239,6 +1405,9 @@ export class ExcelImportService {
         const shippingCost = toNumber(dataRow.cells[headers.shippingCost]) ?? 0;
         const handlingCost = toNumber(dataRow.cells[headers.handlingCost]) ?? 0;
         const orderDate = parseDateLike(dataRow.cells[headers.time]);
+        const estimatedDelivery = headers.deliveryTime
+          ? parseDateLike(dataRow.cells[headers.deliveryTime])
+          : undefined;
         if (headers.time && dataRow.cells[headers.time] && !orderDate) {
           parsed.warnings.push({
             sourceSheet: sheet.name,
@@ -1280,6 +1449,7 @@ export class ExcelImportService {
           order.status = 'CONFIRMED';
           order.shipments.push({
             trackingNumber,
+            estimatedDelivery,
             sourceSheet: sheet.name,
             sourceRow: dataRow.rowNumber,
           });
@@ -1365,7 +1535,9 @@ export class ExcelImportService {
       }
 
       const titleRow = this.findTitleRow(sheet.rows, index);
-      const purchaseDate = parseDateLike(this.extractInvoiceReference(titleRow));
+      const purchaseDate = parseDateLike(
+        this.extractInvoiceReference(titleRow),
+      );
       index += 1;
 
       while (index < sheet.rows.length) {
@@ -1381,9 +1553,17 @@ export class ExcelImportService {
         const totalCost =
           toNumber(dataRow.cells[header.totalCost]) ??
           toNumber(dataRow.cells[header.productCost]) ??
-          0;
+          null;
 
-        if (!sku || quantity === 0 || totalCost === 0) {
+        if (!sku || quantity === 0 || totalCost === null) {
+          if (sku && quantity !== 0) {
+            parsed.warnings.push({
+              sourceSheet: sheet.name,
+              sourceRow: dataRow.rowNumber,
+              severity: 'warning',
+              message: `Stock purchase row for SKU "${sku}" has no cost value and was skipped.`,
+            });
+          }
           index += 1;
           continue;
         }
@@ -1398,7 +1578,7 @@ export class ExcelImportService {
           productName: sku,
           purchaseDate,
           quantity,
-          unitCost: quantity ? totalCost / quantity : undefined,
+          unitCost: quantity > 0 ? totalCost / quantity : undefined,
           totalCost,
           sourceSheet: sheet.name,
           sourceRow: dataRow.rowNumber,
@@ -1445,7 +1625,10 @@ export class ExcelImportService {
         const quantity = toNumber(value);
         if (quantity === null || quantity === 0) continue;
         const column = Number(columnText);
-        const productName = this.findProductForStockColumn(productByColumn, column);
+        const productName = this.findProductForStockColumn(
+          productByColumn,
+          column,
+        );
         if (!productName) continue;
 
         const label = normalizeText(sheet.rows[1]?.cells[column]);
@@ -1467,7 +1650,9 @@ export class ExcelImportService {
           movementDate: parseDateLike(row.cells[column - 1]) ?? undefined,
           movementType,
           quantity,
-          reference: comment ? cellRef : cleanText(row.cells[column - 1]) || undefined,
+          reference: comment
+            ? cellRef
+            : cleanText(row.cells[column - 1]) || undefined,
           comment,
           sourceSheet: sheet.name,
           sourceRow: row.rowNumber,
@@ -1519,9 +1704,29 @@ export class ExcelImportService {
 
       const storeName = cleanText(row.cells[3]);
       const invoiceReference = cleanText(row.cells[4]);
-      const invoiceAmount = toNumber(row.cells[5]);
-      const depositAmount = toNumber(row.cells[2]);
+      const rawDeposit = row.cells[2];
+      const rawInvoice = row.cells[5];
+      const depositAmount = toNumber(rawDeposit);
+      const invoiceAmount = toNumber(rawInvoice);
       const runningBalance = toNumber(row.cells[6]);
+      const exchangeRate = toNumber(row.cells[7]) ?? undefined;
+
+      if (rawDeposit != null && rawDeposit !== '' && depositAmount === null) {
+        parsed.warnings.push({
+          sourceSheet: sheet.name,
+          sourceRow: row.rowNumber,
+          severity: 'warning',
+          message: `Non-numeric deposit amount skipped: ${String(rawDeposit)}`,
+        });
+      }
+      if (rawInvoice != null && rawInvoice !== '' && invoiceAmount === null) {
+        parsed.warnings.push({
+          sourceSheet: sheet.name,
+          sourceRow: row.rowNumber,
+          severity: 'warning',
+          message: `Non-numeric invoice amount skipped: ${String(rawInvoice)}`,
+        });
+      }
 
       if (!storeName && invoiceAmount === null && depositAmount === null) {
         continue;
@@ -1551,21 +1756,36 @@ export class ExcelImportService {
           invoiceReference,
           amount: depositAmount,
           runningBalance: runningBalance ?? undefined,
+          exchangeRate,
           sourceSheet: sheet.name,
           sourceRow: row.rowNumber,
         });
       }
 
-      if (invoiceAmount !== null) {
+      const balanceNote = cleanText(row.cells[6]);
+      const isFixedPriceContract =
+        invoiceAmount === 0 && balanceNote.toLowerCase().includes('fixed');
+
+      if (invoiceAmount !== null && !isFixedPriceContract) {
         parsed.walletTransactions.push({
           storeName: transactionStoreName,
           transactionDate: parseDateLike(row.cells[1]) ?? undefined,
-          transactionType: this.classifyWalletTransaction(transactionStoreName ?? ''),
+          transactionType: this.classifyWalletTransaction(
+            transactionStoreName ?? '',
+          ),
           invoiceReference,
           amount: -Math.abs(invoiceAmount),
           runningBalance: runningBalance ?? undefined,
+          exchangeRate,
           sourceSheet: sheet.name,
           sourceRow: row.rowNumber,
+        });
+      } else if (isFixedPriceContract) {
+        parsed.warnings.push({
+          sourceSheet: sheet.name,
+          sourceRow: row.rowNumber,
+          severity: 'info',
+          message: `Fixed-price contract row skipped for ${storeName || 'unknown store'}: ${balanceNote}`,
         });
       }
     }
@@ -1630,7 +1850,10 @@ export class ExcelImportService {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
 
-      if (message.includes('Authentication failed') || message.includes('P1000')) {
+      if (
+        message.includes('Authentication failed') ||
+        message.includes('P1000')
+      ) {
         throw new BadRequestException(
           'Cannot access the import database because DATABASE_URL credentials are invalid. Fix backend/.env before retrying the import.',
         );
@@ -1701,7 +1924,9 @@ export class ExcelImportService {
     duplicateRecords: string[],
   ): ImportPreview {
     const lineTotals = parsed.orders.flatMap((order) => order.lines);
-    const productLines = lineTotals.filter((line) => line.lineType === 'product');
+    const productLines = lineTotals.filter(
+      (line) => line.lineType === 'product',
+    );
     const shipments = new Set(
       parsed.orders.flatMap((order) =>
         order.shipments.map((shipment) => shipment.trackingNumber),
@@ -1709,7 +1934,9 @@ export class ExcelImportService {
     ).size;
     const currentBalance = [...parsed.walletTransactions]
       .reverse()
-      .find((transaction) => transaction.runningBalance !== null)?.runningBalance;
+      .find(
+        (transaction) => transaction.runningBalance !== null,
+      )?.runningBalance;
 
     return {
       token,
@@ -1787,6 +2014,11 @@ export class ExcelImportService {
         headers.handlingCost = column;
       } else if (label.includes('total cost')) {
         headers.totalCost = column;
+      } else if (
+        label.includes('delivery time') ||
+        label.includes('delivery date')
+      ) {
+        headers.deliveryTime = column;
       } else if (label === 'country') {
         headers.country = column;
       } else if (label.includes('time')) {
@@ -1798,7 +2030,11 @@ export class ExcelImportService {
   }
 
   private findTitleRow(rows: WorkbookRow[], headerIndex: number) {
-    for (let index = headerIndex - 1; index >= Math.max(0, headerIndex - 3); index -= 1) {
+    for (
+      let index = headerIndex - 1;
+      index >= Math.max(0, headerIndex - 3);
+      index -= 1
+    ) {
       if (Object.keys(rows[index]?.cells ?? {}).length > 0) {
         return rows[index];
       }
@@ -1841,7 +2077,8 @@ export class ExcelImportService {
         normalizeProductName(existingBySku.name) === normalizeProductName(sku)
       ) {
         existingBySku.name = product.name;
-        existingBySku.description = product.description ?? existingBySku.description;
+        existingBySku.description =
+          product.description ?? existingBySku.description;
         existingBySku.weight = product.weight ?? existingBySku.weight;
         existingBySku.source = 'quotation';
       }
@@ -1849,11 +2086,13 @@ export class ExcelImportService {
     }
 
     const existingByName = parsed.products.find(
-      (item) => normalizeProductName(item.name) === normalizeProductName(product.name),
+      (item) =>
+        normalizeProductName(item.name) === normalizeProductName(product.name),
     );
 
     if (existingByName && !sku) {
-      existingByName.description = product.description ?? existingByName.description;
+      existingByName.description =
+        product.description ?? existingByName.description;
       existingByName.weight = product.weight ?? existingByName.weight;
       existingByName.quotation = mergeProductQuotation(
         existingByName.quotation,
@@ -1872,7 +2111,9 @@ export class ExcelImportService {
   private toStore(name: string): ParsedStore {
     const normalizedName = normalizeStoreName(name);
     const country = this.extractCountry(name);
-    const platform = name.toLowerCase().includes('woo') ? 'WooCommerce' : undefined;
+    const platform = name.toLowerCase().includes('woo')
+      ? 'WooCommerce'
+      : undefined;
 
     return { name, normalizedName, country, platform };
   }
@@ -1923,7 +2164,9 @@ export class ExcelImportService {
   }
 
   private lookupStoreId(storeIds: Map<string, string>, storeName: string) {
-    return storeIds.get(storeName) ?? storeIds.get(normalizeStoreName(storeName));
+    return (
+      storeIds.get(storeName) ?? storeIds.get(normalizeStoreName(storeName))
+    );
   }
 
   private requireStoreId(storeIds: Map<string, string>, storeName: string) {
@@ -1972,12 +2215,36 @@ function normalizeProductName(value: string) {
   return normalizeText(value).replace(/\s+/g, ' ');
 }
 
+function normalizeDecoderText(value: unknown) {
+  return normalizeText(value)
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .replace(/[\[\]()+/_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function canonicalSkuKey(value: unknown) {
+  const sku = cleanText(value);
+  const match = sku.match(/-(\d+)\s*$/);
+  return match?.[1] ?? sku;
+}
+
+function isDecoderSkuCode(value: string) {
+  const sku = cleanText(value);
+  if (/^product id$|^sku$/i.test(sku)) return false;
+  if (sku.includes(' ')) return false;
+  return /^[A-Za-z0-9][A-Za-z0-9_-]{1,79}$/.test(sku);
+}
+
 function splitSkuAliases(value: unknown) {
   if (value === null || value === undefined) return [];
   return String(value)
     .split(/\r?\n|,|;/)
     .map((item) => cleanText(item))
-    .filter((item) => item && item !== '/' && !normalizeText(item).includes('sku'));
+    .filter(
+      (item) => item && item !== '/' && !normalizeText(item).includes('sku'),
+    );
 }
 
 type QuotationData = NonNullable<ParsedProduct['quotation']>;
@@ -2050,7 +2317,10 @@ function cleanQuotationProductName(value: unknown): QuotationNameInfo {
 
 function cleanQuotationDescription(value: unknown, productName: string) {
   const text = cleanText(value);
-  if (!text || normalizeProductName(text) === normalizeProductName(productName)) {
+  if (
+    !text ||
+    normalizeProductName(text) === normalizeProductName(productName)
+  ) {
     return undefined;
   }
   return isUsefulQuotationProductName(text) ? text : undefined;
@@ -2082,9 +2352,7 @@ function extractQuotationData(
     ...nameInfo.notes,
     ...nameInfo.stockNotes,
   ];
-  const rowNotes = uniqueStrings([
-    ...rowOnlyNotes,
-  ]);
+  const rowNotes = uniqueStrings([...rowOnlyNotes]);
   const quotationRow = {
     sourceKey: `${sheetName}:${row.rowNumber}`,
     sourceSheet: sheetName,
@@ -2140,7 +2408,9 @@ function extractQuotationData(
     countryAmount('DE', row.cells[9]),
     countryAmount('GB', row.cells[10]),
     countryAmount('USA', row.cells[11]),
-  ].filter((item): item is { country: string; amount: number } => Boolean(item));
+  ].filter((item): item is { country: string; amount: number } =>
+    Boolean(item),
+  );
   if (freightByCountry.length > 0) {
     quotation.freightByCountry = freightByCountry;
   }
@@ -2150,7 +2420,9 @@ function extractQuotationData(
     countryAmount('DE', row.cells[14]),
     countryAmount('GB', row.cells[15]),
     countryAmount('USA', row.cells[16]),
-  ].filter((item): item is { country: string; amount: number } => Boolean(item));
+  ].filter((item): item is { country: string; amount: number } =>
+    Boolean(item),
+  );
   if (landedCostByCountry.length > 0) {
     quotation.landedCostByCountry = landedCostByCountry;
   }
@@ -2181,7 +2453,12 @@ function extractQuotationData(
   if (notes.length > 0) {
     quotation.notes = uniqueStrings(notes);
   }
-  if (quantity !== null || unitPrice !== null || landedCost !== null || quotation.sellingPrice !== undefined) {
+  if (
+    quantity !== null ||
+    unitPrice !== null ||
+    landedCost !== null ||
+    quotation.sellingPrice !== undefined
+  ) {
     quotation.priceTiers = [
       {
         quantity: quantity ?? undefined,
@@ -2227,12 +2504,12 @@ function isQuotationNoteText(value: string) {
   const lower = normalizeText(value);
   return Boolean(
     lower &&
-      (lower.includes('stock at warehouse') ||
-        lower.includes('warehouse') ||
-        lower.includes('ship only') ||
-        lower.includes('per order') ||
-        lower.includes('will removed') ||
-        lower.includes('will be removed')),
+    (lower.includes('stock at warehouse') ||
+      lower.includes('warehouse') ||
+      lower.includes('ship only') ||
+      lower.includes('per order') ||
+      lower.includes('will removed') ||
+      lower.includes('will be removed')),
   );
 }
 
@@ -2304,7 +2581,10 @@ function mergeProductQuotation(
     ...(existing.stockNotes ?? []),
     ...(next.stockNotes ?? []),
   ]);
-  merged.notes = uniqueStrings([...(existing.notes ?? []), ...(next.notes ?? [])]);
+  merged.notes = uniqueStrings([
+    ...(existing.notes ?? []),
+    ...(next.notes ?? []),
+  ]);
   merged.quotationRows = uniqueObjects([
     ...(existing.quotationRows ?? []),
     ...(next.quotationRows ?? []),
@@ -2364,7 +2644,9 @@ function extractMoqText(value: string) {
 
 function looksLikeDeliveryTime(value: string) {
   const lower = normalizeText(value);
-  return /\d/.test(lower) && /(day|days|week|weeks|month|months|working)/.test(lower);
+  return (
+    /\d/.test(lower) && /(day|days|week|weeks|month|months|working)/.test(lower)
+  );
 }
 
 function isNumericText(value: string) {
@@ -2399,7 +2681,10 @@ function toNumber(value: unknown): number | null {
 function parseDateLike(value: unknown): Date | undefined {
   const numeric = toNumber(value);
   if (numeric !== null && numeric > 20000 && numeric < 70000) {
-    return new Date(Date.UTC(1899, 11, 30 + Math.floor(numeric)));
+    const wholeDays = Math.floor(numeric);
+    const fractionalDay = numeric - wholeDays;
+    const milliseconds = Math.round(fractionalDay * 86400000);
+    return new Date(Date.UTC(1899, 11, 30 + wholeDays) + milliseconds);
   }
 
   const text = cleanText(value);
@@ -2433,17 +2718,16 @@ function sum<T extends Record<K, number>, K extends keyof T>(
   values: T[],
   key: K,
 ) {
-  return Number(values.reduce((total, item) => total + item[key], 0).toFixed(2));
+  return Number(
+    values.reduce((total, item) => total + item[key], 0).toFixed(2),
+  );
 }
 
 function sumLineTotals(lines: ParsedOrderLine[]) {
   return roundMoney(
     lines.reduce(
       (total, line) =>
-        total +
-        line.productCost +
-        line.shippingCost +
-        line.handlingCost,
+        total + line.productCost + line.shippingCost + line.handlingCost,
       0,
     ),
   );
@@ -2463,10 +2747,10 @@ function isRealTrackingNumber(value: string) {
   const normalized = normalizeText(value);
   return Boolean(
     normalized &&
-      normalized !== '/' &&
-      normalized !== '-' &&
-      normalized !== 'n/a' &&
-      normalized !== 'na',
+    normalized !== '/' &&
+    normalized !== '-' &&
+    normalized !== 'n/a' &&
+    normalized !== 'na',
   );
 }
 
@@ -2476,7 +2760,11 @@ function classifyMovement(comment: string) {
   if (text.includes('transfer')) return 'transfer';
   if (text.includes('arrive') || text.includes('warehouse')) return 'arrival';
   if (text.includes('adjust') || text.includes('fix')) return 'adjustment';
-  if (text.includes('stock') || text.includes('receive') || text.includes('inbound')) {
+  if (
+    text.includes('stock') ||
+    text.includes('receive') ||
+    text.includes('inbound')
+  ) {
     return 'inbound';
   }
   if (text.includes('used') || text.includes('consum')) return 'consumption';

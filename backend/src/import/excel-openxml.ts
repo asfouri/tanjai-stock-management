@@ -52,7 +52,9 @@ export function parseXlsxWorkbook(buffer: Buffer): ParsedWorkbook {
 
   const sharedStrings = parseSharedStrings(getText('xl/sharedStrings.xml'));
   const workbookXml = getText('xl/workbook.xml');
-  const workbookRels = parseRelationships(getText('xl/_rels/workbook.xml.rels'));
+  const workbookRels = parseRelationships(
+    getText('xl/_rels/workbook.xml.rels'),
+  );
   const workbookSheets = parseWorkbookSheets(workbookXml);
 
   const sheets = workbookSheets.map((sheet) => {
@@ -272,7 +274,14 @@ function parseCellValue(
   }
 
   if (raw !== '' && Number.isFinite(Number(raw))) {
-    return Number(raw);
+    const value = Number(raw);
+    if (
+      Number.isInteger(value) &&
+      (value > Number.MAX_SAFE_INTEGER || value < -Number.MAX_SAFE_INTEGER)
+    ) {
+      return raw;
+    }
+    return value;
   }
 
   return raw;
@@ -361,8 +370,7 @@ function readSheetImages(
         const rowIndex = numberFromTag(fromXml, 'row');
         const columnIndex = numberFromTag(fromXml, 'col');
         const sourceRow = rowIndex === null ? undefined : rowIndex + 1;
-        const sourceColumn =
-          columnIndex === null ? undefined : columnIndex + 1;
+        const sourceColumn = columnIndex === null ? undefined : columnIndex + 1;
         const relationshipId = anchorXml.match(/r:embed="([^"]+)"/)?.[1];
         const imageTarget = relationshipId
           ? drawingRels[relationshipId]

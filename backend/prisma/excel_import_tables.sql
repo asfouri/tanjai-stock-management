@@ -198,6 +198,9 @@ create index if not exists excel_wallet_transactions_invoice_reference_idx
 create index if not exists excel_wallet_transactions_transaction_date_idx
   on public.excel_wallet_transactions ("transactionDate");
 
+alter table public.excel_wallet_transactions
+  add column if not exists "exchangeRate" double precision;
+
 create table if not exists public.excel_anomalies (
   id text primary key default gen_random_uuid()::text,
   "importBatchId" text references public.excel_import_batches(id),
