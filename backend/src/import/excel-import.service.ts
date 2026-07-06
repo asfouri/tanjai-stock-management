@@ -1625,11 +1625,11 @@ export class ExcelImportService {
         const quantity = toNumber(value);
         if (quantity === null || quantity === 0) continue;
         const column = Number(columnText);
-        const productName = this.findProductForStockColumn(
+        const productColumn = this.findProductForStockColumn(
           productByColumn,
           column,
         );
-        if (!productName) continue;
+        if (!productColumn) continue;
 
         const label = normalizeText(sheet.rows[1]?.cells[column]);
         if (!['stock', 'used'].includes(label)) continue;
@@ -1646,8 +1646,10 @@ export class ExcelImportService {
             : 'inbound';
 
         parsed.inventoryMovements.push({
-          productName,
-          movementDate: parseDateLike(row.cells[column - 1]) ?? undefined,
+          productName: productColumn.productName,
+          movementDate:
+            parseDateLike(row.cells[productColumn.headerColumn - 1]) ??
+            undefined,
           movementType,
           quantity,
           reference: comment
@@ -1666,7 +1668,8 @@ export class ExcelImportService {
       const column = columnToNumber(cellRef);
       const rowNumber = Number(cellRef.match(/\d+/)?.[0] ?? 0);
       const productName =
-        this.findProductForStockColumn(productByColumn, column) ?? undefined;
+        this.findProductForStockColumn(productByColumn, column)?.productName ??
+        undefined;
       const movementType = classifyMovement(comment);
       const quantity = extractFirstNumber(comment);
 
@@ -1703,7 +1706,7 @@ export class ExcelImportService {
       if (normalizeText(row.cells[1]) === 'sum') continue;
 
       const storeName = cleanText(row.cells[3]);
-      const invoiceReference = cleanText(row.cells[4]);
+      const invoiceReference = formatInvoiceReference(cleanText(row.cells[4]));
       const rawDeposit = row.cells[2];
       const rawInvoice = row.cells[5];
       const depositAmount = toNumber(rawDeposit);
@@ -1734,12 +1737,19 @@ export class ExcelImportService {
 
       if (storeName) {
         const isBrandOwner = this.isBrandOwnerName(storeName);
+        const isTransactionCategory = ['stock', 'tax'].includes(
+          normalizeStoreName(storeName),
+        );
         if (isBrandOwner) {
           parsed.brandName = storeName;
         }
 
         const store = this.toStore(storeName);
-        if (!isBrandOwner && !storeNames.has(store.normalizedName)) {
+        if (
+          !isBrandOwner &&
+          !isTransactionCategory &&
+          !storeNames.has(store.normalizedName)
+        ) {
           parsed.stores.push(store);
           storeNames.add(store.normalizedName);
         }
@@ -2049,7 +2059,7 @@ export class ExcelImportService {
     for (const column of [3, 4, 2, 1]) {
       const value = cleanText(row.cells[column]);
       if (value && normalizeText(value) !== 'marcus') {
-        return value;
+        return formatInvoiceReference(value);
       }
     }
 
@@ -2158,9 +2168,13 @@ export class ExcelImportService {
     productByColumn: Map<number, string>,
     column: number,
   ) {
-    return [...productByColumn.entries()]
+    const match = [...productByColumn.entries()]
       .filter(([productColumn]) => productColumn <= column)
-      .sort(([left], [right]) => right - left)[0]?.[1];
+      .sort(([left], [right]) => right - left)[0];
+
+    return match
+      ? { headerColumn: match[0], productName: match[1] }
+      : undefined;
   }
 
   private lookupStoreId(storeIds: Map<string, string>, storeName: string) {
@@ -2695,6 +2709,14 @@ function parseDateLike(value: unknown): Date | undefined {
   }
 
   return undefined;
+}
+
+function formatInvoiceReference(value: string) {
+  const numeric = toNumber(value);
+  if (numeric === null || numeric < 40000 || numeric > 60000) return value;
+
+  const date = parseDateLike(value);
+  return date ? date.toISOString().slice(0, 10) : value;
 }
 
 function parseInvoiceDate(row: WorkbookRow | undefined): Date | undefined {

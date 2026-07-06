@@ -206,10 +206,15 @@ function parseWorkbookSheets(xml: string) {
   return sheets;
 }
 
-function parseRows(xml: string, sharedStrings: string[], sheetName: string) {
+export function parseRows(
+  xml: string,
+  sharedStrings: string[],
+  sheetName: string,
+) {
   const rows: WorkbookRow[] = [];
   const rowRegex = /<row\b([^>]*)>([\s\S]*?)<\/row>/g;
-  const cellRegex = /<c\b([^>]*)>([\s\S]*?)<\/c>/g;
+  // Excel may emit styled empty cells as <c .../>; do not let them consume the next real cell.
+  const cellRegex = /<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g;
 
   for (const rowMatch of xml.matchAll(rowRegex)) {
     const rowAttrs = parseAttributes(rowMatch[1]);
@@ -220,7 +225,7 @@ function parseRows(xml: string, sharedStrings: string[], sheetName: string) {
       const attrs = parseAttributes(cellMatch[1]);
       const column = columnToNumber(attrs.r || '');
       const value = parseCellValue(
-        cellMatch[2],
+        cellMatch[2] ?? '',
         attrs.t,
         sharedStrings,
         sheetName,

@@ -4,6 +4,16 @@ import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 
+function getAuthErrorMessage(error: unknown) {
+  if (error instanceof Error) {
+    return error.message && error.message !== "{}"
+      ? error.message
+      : "Unable to reach Supabase Auth. Check your network connection.";
+  }
+
+  return "Unable to reach Supabase Auth. Check your network connection.";
+}
+
 export default function LoginPage() {
   const router = useRouter();
   const [email, setEmail] = useState("");
@@ -27,11 +37,7 @@ export default function LoginPage() {
         }
       } catch (error) {
         if (isMounted) {
-          setMessage(
-            error instanceof Error
-              ? error.message
-              : "Unable to initialize Supabase."
-          );
+          setMessage(getAuthErrorMessage(error));
         }
       }
 
@@ -73,16 +79,14 @@ export default function LoginPage() {
       });
 
       if (error) {
-        setMessage(error.message);
+        setMessage(getAuthErrorMessage(error));
         return;
       }
 
       router.replace("/dashboard");
       router.refresh();
     } catch (error) {
-      setMessage(
-        error instanceof Error ? error.message : "Unable to sign in right now."
-      );
+      setMessage(getAuthErrorMessage(error));
     } finally {
       setIsSubmitting(false);
     }

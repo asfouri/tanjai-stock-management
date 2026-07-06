@@ -35,8 +35,11 @@ export class AppController {
 
   @Get('dashboard/section/:section')
   @UseGuards(SupabaseAuthGuard)
-  getDashboardSection(@Param('section') section: string) {
-    return this.appService.getDashboardSection(section);
+  getDashboardSection(
+    @Param('section') section: string,
+    @Query() filters: Record<string, string>,
+  ) {
+    return this.appService.getDashboardSection(section, filters);
   }
 
   @Post('imports/excel/preview')

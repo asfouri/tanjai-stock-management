@@ -80,6 +80,7 @@ type LoadedSectionCache = Partial<Record<Exclude<SectionId, "dashboard">, true>>
 export default function DashboardPage() {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const loadedSectionQueryRef = useRef<Partial<Record<SectionId, string>>>({});
   const [user, setUser] = useState<User | null>(null);
   const [activeSection, setActiveSection] = useState<SectionId>("dashboard");
   const [summary, setSummary] = useState<DashboardSummary>(emptySummary);
@@ -117,6 +118,31 @@ export default function DashboardPage() {
     }
     return params.toString();
   }, [filters]);
+
+  const orderSectionQuery = useMemo(() => {
+    const params = new URLSearchParams();
+    for (const key of [
+      "store",
+      "dateFrom",
+      "dateTo",
+      "orderNumber",
+      "invoice",
+      "sku",
+      "trackingNumber",
+    ] as const) {
+      const value = filters[key].trim();
+      if (value) params.set(key, value);
+    }
+    return params.toString();
+  }, [
+    filters.store,
+    filters.dateFrom,
+    filters.dateTo,
+    filters.orderNumber,
+    filters.invoice,
+    filters.sku,
+    filters.trackingNumber,
+  ]);
 
   useEffect(() => {
     let isMounted = true;
@@ -170,7 +196,12 @@ export default function DashboardPage() {
       return;
     }
 
-    if (loadedSectionCache[activeSection]) {
+    const sectionQuery = activeSection === "orders" ? orderSectionQuery : "";
+
+    if (
+      loadedSectionCache[activeSection] &&
+      loadedSectionQueryRef.current[activeSection] === sectionQuery
+    ) {
       return;
     }
 
@@ -197,7 +228,9 @@ export default function DashboardPage() {
         }
 
         const response = await apiFetch(
-          `${apiBaseUrl}/dashboard/section/${activeSection}`
+          `${apiBaseUrl}/dashboard/section/${activeSection}${
+            sectionQuery ? `?${sectionQuery}` : ""
+          }`
         );
 
         if (!response.ok) {
@@ -212,6 +245,7 @@ export default function DashboardPage() {
             ...cache,
             [activeSection]: data,
           }));
+          loadedSectionQueryRef.current[activeSection] = sectionQuery;
           setLoadedSectionCache((cache) => ({
             ...cache,
             [activeSection]: true,
@@ -237,7 +271,7 @@ export default function DashboardPage() {
     return () => {
       isMounted = false;
     };
-  }, [activeSection, loadedSectionCache, refreshKey]);
+  }, [activeSection, loadedSectionCache, orderSectionQuery, refreshKey]);
 
   async function refreshDashboard() {
     setIsLoading(true);
@@ -257,6 +291,7 @@ export default function DashboardPage() {
   function invalidateSectionCache() {
     setSectionDataCache({});
     setLoadedSectionCache({});
+    loadedSectionQueryRef.current = {};
   }
 
   async function handleLogout() {
@@ -281,12 +316,15 @@ export default function DashboardPage() {
     setErrorMessage("");
 
     try {
-      const response = await apiFetch(`${apiBaseUrl}/imports/excel/preview-local`, {
+      const response = await apiFetch(`${apiBaseUrl}/imports/excel/preview`, {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
+          "Content-Type":
+            file.type ||
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "x-file-name": encodeURIComponent(file.name),
         },
-        body: JSON.stringify({ fileName: file.name }),
+        body: file,
       });
 
       if (!response.ok) {
@@ -382,7 +420,7 @@ export default function DashboardPage() {
   ];
 
   return (
-    <main className="min-h-screen overflow-x-hidden bg-zinc-50 text-zinc-950">
+    <main className="min-h-screen bg-zinc-50 text-zinc-950">
       <aside className="fixed inset-y-0 left-0 hidden w-64 flex-col border-r border-zinc-200 bg-white px-5 py-6 md:flex">
         <div className="text-lg font-semibold">TanjAI Stock</div>
         <nav className="mt-8 space-y-1" aria-label="Dashboard sections">
@@ -689,13 +727,32 @@ export default function DashboardPage() {
                 }}
                 onSelectProduct={setSelectedProduct}
               />
+            ) : activeSection === "orders" ? (
+              <div className="flex h-[calc(100vh-9rem)] min-h-[30rem] flex-col gap-3 overflow-hidden">
+                <div className="shrink-0">
+                  <OrderFiltersPanel
+                    filters={filters}
+                    invoices={summary.filterOptions.invoices}
+                    skus={summary.filterOptions.skus}
+                    stores={summary.filterOptions.stores}
+                    onChange={setFilters}
+                  />
+                </div>
+                <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+                  <OrdersSection
+                    data={sectionData}
+                    isLoading={isSectionLoading}
+                    onSelectProduct={setSelectedProduct}
+                  />
+                </div>
+              </div>
             ) : (
               <SectionTable
                 data={sectionData}
                 isLoading={isSectionLoading}
                 title={
-                  sidebarItems.find((item) => item.id === activeSection)?.label ??
-                  "Section"
+                  sidebarItems.find((item) => item.id === activeSection)
+                    ?.label ?? "Section"
                 }
               />
             )
@@ -1189,6 +1246,443 @@ function SkuChips({ skus }: { skus: string[] }) {
   );
 }
 
+type OrderLineRow = Record<string, SectionData["rows"][number][string]> & {
+  orderNumber?: string;
+  store?: string;
+  invoice?: string;
+  status?: string;
+  date?: string;
+  trackingNumbers?: string;
+  sku?: string;
+  quantity?: number;
+  productCost?: number;
+  shippingCost?: number;
+  handlingCost?: number;
+  totalCost?: number;
+  lineType?: string;
+  sourceSheet?: string;
+  sourceRow?: number;
+  product?: ProductRow | null;
+};
+
+function normalizeOrderRows(rows: SectionData["rows"]) {
+  return uniqueByKey(
+    (rows as OrderLineRow[]).map((row) => ({
+      ...row,
+      orderNumber: cleanKeyPart(row.orderNumber),
+      store: cleanKeyPart(row.store),
+      invoice: cleanKeyPart(row.invoice),
+      status: cleanKeyPart(row.status),
+      date: cleanKeyPart(row.date),
+      trackingNumbers: cleanKeyPart(row.trackingNumbers),
+      sku: cleanKeyPart(row.sku),
+    })),
+    orderLineRowKey,
+  );
+}
+
+function OrderFiltersPanel({
+  filters,
+  invoices,
+  skus,
+  stores,
+  onChange,
+}: {
+  filters: Filters;
+  invoices: string[];
+  skus: string[];
+  stores: string[];
+  onChange: (filters: Filters) => void;
+}) {
+  return (
+    <section className="min-w-0 rounded-lg border border-zinc-200 bg-white/95 px-4 py-3 shadow-sm backdrop-blur [&_input]:h-9 [&_select]:h-9">
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-sm font-semibold">Order filters</h2>
+        <button
+          className="h-8 rounded-md border border-zinc-300 px-3 text-xs font-medium transition hover:bg-zinc-50"
+          type="button"
+          onClick={() =>
+            onChange({
+              ...filters,
+              store: "",
+              dateFrom: "",
+              dateTo: "",
+              orderNumber: "",
+              invoice: "",
+              sku: "",
+              trackingNumber: "",
+            })
+          }
+        >
+          Clear
+        </button>
+      </div>
+
+      <div className="mt-2 grid gap-2 md:grid-cols-4 2xl:grid-cols-7">
+        <FilterSelect
+          label="Store"
+          placeholder="All stores"
+          options={stores}
+          value={filters.store}
+          onChange={(value) => onChange({ ...filters, store: value })}
+        />
+        <FilterInput
+          label="Date from"
+          type="date"
+          value={filters.dateFrom}
+          onChange={(value) => onChange({ ...filters, dateFrom: value })}
+        />
+        <FilterInput
+          label="Date to"
+          type="date"
+          value={filters.dateTo}
+          onChange={(value) => onChange({ ...filters, dateTo: value })}
+        />
+        <FilterInput
+          label="Order number"
+          placeholder="Search order number"
+          value={filters.orderNumber}
+          onChange={(value) => onChange({ ...filters, orderNumber: value })}
+        />
+        <FilterSelect
+          label="Invoice"
+          placeholder="All invoices"
+          options={invoices}
+          value={filters.invoice}
+          onChange={(value) => onChange({ ...filters, invoice: value })}
+        />
+        <FilterSelect
+          label="SKU / product"
+          placeholder="All SKUs"
+          options={skus}
+          value={filters.sku}
+          onChange={(value) => onChange({ ...filters, sku: value })}
+        />
+        <FilterInput
+          label="Tracking number"
+          placeholder="Search tracking"
+          value={filters.trackingNumber}
+          onChange={(value) => onChange({ ...filters, trackingNumber: value })}
+        />
+      </div>
+    </section>
+  );
+}
+
+function OrdersSection({
+  data,
+  isLoading,
+  onSelectProduct,
+}: {
+  data: SectionData | null;
+  isLoading: boolean;
+  onSelectProduct: (product: ProductRow) => void;
+}) {
+  const [selectedOrder, setSelectedOrder] = useState<OrderLineRow | null>(null);
+  const [selectedProductSummary, setSelectedProductSummary] =
+    useState<ProductRow | null>(null);
+  const rows = useMemo(
+    () => normalizeOrderRows(data?.rows ?? []),
+    [data],
+  );
+
+  if (isLoading) {
+    return (
+      <div className="rounded-lg border border-zinc-200 bg-white p-5 text-sm text-zinc-600">
+        Loading orders...
+      </div>
+    );
+  }
+
+  if (rows.length === 0) {
+    return (
+      <Panel title="Orders">
+        <EmptyState label="No orders found." />
+      </Panel>
+    );
+  }
+
+  return (
+    <>
+      <Panel title={`Orders (${formatNumber(rows.length)})`}>
+        <div className="overflow-hidden">
+          <table className="w-full table-fixed text-left text-sm">
+            <colgroup>
+              <col className="w-[16%]" />
+              <col className="w-[18%]" />
+              <col className="hidden w-[13%] md:table-column" />
+              <col className="w-[19%]" />
+              <col className="hidden w-[18%] lg:table-column" />
+              <col className="w-[14%]" />
+              <col className="w-[13%]" />
+            </colgroup>
+            <thead>
+              <tr className="border-b border-zinc-200 text-xs uppercase tracking-wide text-zinc-500">
+                <th className="px-2 py-3 font-semibold">Order</th>
+                <th className="px-2 py-3 font-semibold">Store</th>
+                <th className="hidden px-2 py-3 font-semibold md:table-cell">
+                  Date
+                </th>
+                <th className="px-2 py-3 font-semibold">Tracking</th>
+                <th className="hidden px-2 py-3 font-semibold lg:table-cell">
+                  Product
+                </th>
+                <th className="px-2 py-3 text-right font-semibold">Total</th>
+                <th className="px-2 py-3 text-right font-semibold">View</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-100">
+              {rows.map((row) => (
+                <tr className="align-top hover:bg-zinc-50" key={orderLineRowKey(row) as string}>
+                  <td className="min-w-0 px-2 py-3">
+                    <p className="truncate font-medium text-zinc-900">
+                      {row.orderNumber || "-"}
+                    </p>
+                    <p className="mt-1 truncate text-xs text-zinc-500 md:hidden">
+                      {row.date || "-"}
+                    </p>
+                  </td>
+                  <td className="min-w-0 px-2 py-3">
+                    <p className="truncate text-zinc-700">{row.store || "-"}</p>
+                  </td>
+                  <td className="hidden whitespace-nowrap px-2 py-3 text-zinc-700 md:table-cell">
+                    {row.date || "-"}
+                  </td>
+                  <td className="min-w-0 px-2 py-3">
+                    <p className="truncate text-zinc-700" title={row.trackingNumbers}>
+                      {row.trackingNumbers || "-"}
+                    </p>
+                  </td>
+                  <td className="hidden min-w-0 px-2 py-3 lg:table-cell">
+                    <p className="truncate text-zinc-700" title={row.sku}>
+                      {row.sku || "-"}
+                    </p>
+                  </td>
+                  <td className="whitespace-nowrap px-2 py-3 text-right tabular-nums text-zinc-700">
+                    {formatCurrency(Number(row.totalCost ?? 0))}
+                  </td>
+                  <td className="px-2 py-3 text-right">
+                    <button
+                      className="h-8 rounded-md border border-zinc-300 px-2 text-xs font-medium transition hover:bg-white"
+                      type="button"
+                      onClick={() => setSelectedOrder(row)}
+                    >
+                      Details
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Panel>
+
+      {selectedOrder ? (
+        <OrderDetailsModal
+          order={selectedOrder}
+          onClose={() => setSelectedOrder(null)}
+          onSelectProduct={(product) => {
+            setSelectedOrder(null);
+            setSelectedProductSummary(product);
+          }}
+        />
+      ) : null}
+      {selectedProductSummary ? (
+        <FastProductSummaryModal
+          product={selectedProductSummary}
+          onClose={() => setSelectedProductSummary(null)}
+          onOpenFullDetails={() => {
+            setSelectedProductSummary(null);
+            onSelectProduct(selectedProductSummary);
+          }}
+        />
+      ) : null}
+    </>
+  );
+}
+
+function orderLineRowKey(row: OrderLineRow) {
+  return [
+    cleanKeyPart(row.orderNumber),
+    cleanKeyPart(row.invoice),
+    cleanKeyPart(row.store),
+    cleanKeyPart(row.sku),
+    cleanKeyPart(row.sourceSheet),
+    row.sourceRow ?? "",
+  ]
+    .join("|")
+    .trim();
+}
+
+function OrderDetailsModal({
+  order,
+  onClose,
+  onSelectProduct,
+}: {
+  order: OrderLineRow;
+  onClose: () => void;
+  onSelectProduct: (product: ProductRow) => void;
+}) {
+  const product = isProductRow(order.product) ? order.product : null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/40 p-4">
+      <div className="max-h-[90vh] w-full max-w-4xl overflow-auto rounded-lg bg-white p-5 shadow-xl">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold">
+              Order {order.orderNumber || "-"}
+            </h2>
+            <p className="mt-1 text-sm text-zinc-500">
+              {order.store || "-"} · {order.date || "-"}
+            </p>
+          </div>
+          <button
+            className="h-9 rounded-md border border-zinc-300 px-3 text-sm"
+            type="button"
+            onClick={onClose}
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <DetailItem label="Invoice" value={order.invoice} />
+          <DetailItem label="Status" value={order.status} />
+          <DetailItem label="Tracking" value={order.trackingNumbers} />
+          <DetailItem label="Line type" value={order.lineType} />
+        </div>
+
+        <section className="mt-5 rounded-md border border-zinc-200 p-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              <h3 className="text-sm font-semibold">Product line</h3>
+              <p className="mt-2 truncate text-sm text-zinc-700">
+                {order.sku || "-"}
+              </p>
+            </div>
+            {product ? (
+              <button
+                className="h-9 rounded-md border border-zinc-300 px-3 text-sm font-medium transition hover:bg-zinc-50"
+                type="button"
+                onClick={() => onSelectProduct(product)}
+              >
+                Product info
+              </button>
+            ) : null}
+          </div>
+
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <DetailItem label="Quantity" value={order.quantity} />
+            <DetailItem label="Product cost" value={formatCurrency(Number(order.productCost ?? 0))} />
+            <DetailItem label="Shipping cost" value={formatCurrency(Number(order.shippingCost ?? 0))} />
+            <DetailItem label="Handling cost" value={formatCurrency(Number(order.handlingCost ?? 0))} />
+            <DetailItem label="Total cost" value={formatCurrency(Number(order.totalCost ?? 0))} />
+          </div>
+        </section>
+
+        <section className="mt-5 rounded-md border border-zinc-200 p-4">
+          <h3 className="text-sm font-semibold">Import source</h3>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <DetailItem label="Source sheet" value={order.sourceSheet} />
+            <DetailItem label="Source row" value={order.sourceRow} />
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function DetailItem({
+  label,
+  value,
+}: {
+  label: string;
+  value: string | number | null | undefined;
+}) {
+  return (
+    <div className="min-w-0 rounded-md bg-zinc-50 p-3">
+      <p className="text-xs font-medium text-zinc-500">{label}</p>
+      <p className="mt-1 truncate text-sm font-medium text-zinc-900" title={String(value ?? "")}>
+        {value === null || value === undefined || value === "" ? "-" : value}
+      </p>
+    </div>
+  );
+}
+
+function FastProductSummaryModal({
+  product,
+  onClose,
+  onOpenFullDetails,
+}: {
+  product: ProductRow;
+  onClose: () => void;
+  onOpenFullDetails: () => void;
+}) {
+  const skus = uniqueNonEmptyStrings(product.skuAliases);
+  const stores = uniqueNonEmptyStrings(product.stores);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/40 p-4">
+      <div className="max-h-[90vh] w-full max-w-2xl overflow-auto rounded-lg bg-white p-5 shadow-xl">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h2 className="truncate text-lg font-semibold">{product.name}</h2>
+            <p className="mt-1 line-clamp-2 text-sm text-zinc-500">
+              {product.description || "No description"}
+            </p>
+          </div>
+          <button
+            className="h-9 rounded-md border border-zinc-300 px-3 text-sm"
+            type="button"
+            onClick={onClose}
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="mt-5 grid gap-4 sm:grid-cols-[7rem_1fr]">
+          <ProductImage
+            alt={`${product.name || "Product"} image`}
+            size="large"
+            src={product.imageUrl}
+          />
+          <div className="grid gap-3 sm:grid-cols-2">
+            <DetailItem label="Weight" value={product.weight} />
+            <DetailItem label="Order lines" value={product.orderLines ?? 0} />
+            <DetailItem label="Stock purchases" value={product.stockPurchases ?? 0} />
+            <DetailItem label="Inventory moves" value={product.inventoryMovements ?? 0} />
+          </div>
+        </div>
+
+        <section className="mt-5 rounded-md border border-zinc-200 p-4">
+          <h3 className="text-sm font-semibold">SKUs</h3>
+          <div className="mt-3">
+            <SkuChips skus={skus} />
+          </div>
+        </section>
+
+        <section className="mt-5 rounded-md border border-zinc-200 p-4">
+          <h3 className="text-sm font-semibold">Stores</h3>
+          <p className="mt-2 text-sm text-zinc-700">
+            {stores.length > 0 ? stores.join(", ") : "-"}
+          </p>
+        </section>
+
+        <div className="mt-5 flex justify-end">
+          <button
+            className="h-9 rounded-md bg-zinc-950 px-3 text-sm font-medium text-white transition hover:bg-zinc-800"
+            type="button"
+            onClick={onOpenFullDetails}
+          >
+            Full details
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ProductDetailsModal({
   product,
   onClose,
@@ -1390,53 +1884,24 @@ function quotationValue(value: string | number | undefined | null) {
   return typeof value === "number" ? formatNumber(value) : String(value);
 }
 
-function AmountList({
-  title,
-  items,
-}: {
-  title: string;
-  items: Array<{ country: string; amount: number }>;
-}) {
-  const visibleItems = uniqueByKey(
-    items.filter(
-      (item) => cleanKeyPart(item.country) && Number.isFinite(item.amount),
-    ),
-    (item) => `${cleanKeyPart(item.country)}-${item.amount}`,
-  );
-
+function isProductRow(value: unknown): value is ProductRow {
   return (
-    <section>
-      <h4 className="text-sm font-semibold">{title}</h4>
-      {visibleItems.length > 0 ? (
-        <div className="mt-3 rounded-md border border-zinc-200">
-          {visibleItems.map((item) => (
-            <div
-              className="flex items-center justify-between gap-4 border-b border-zinc-100 px-3 py-2 text-sm last:border-b-0"
-              key={`${cleanKeyPart(item.country)}-${item.amount}`}
-            >
-              <span>{item.country}</span>
-              <span className="font-medium tabular-nums">
-                {formatCurrency(item.amount)}
-              </span>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <p className="mt-3 rounded-md border border-dashed border-zinc-200 p-3 text-sm text-zinc-500">
-          None
-        </p>
-      )}
-    </section>
+    value !== null &&
+    typeof value === "object" &&
+    "name" in value &&
+    typeof (value as { name?: unknown }).name === "string"
   );
 }
 
 function SectionTable({
   data,
   isLoading,
+  onSelectProduct,
   title,
 }: {
   data: SectionData | null;
   isLoading: boolean;
+  onSelectProduct?: (product: ProductRow) => void;
   title: string;
 }) {
   if (isLoading) {
@@ -1479,7 +1944,21 @@ function SectionTable({
                     key={column.key}
                     title={String(row[column.key] ?? "")}
                   >
-                    {formatCellValue(row[column.key])}
+                    {column.key === "sku" && isProductRow(row.product) ? (
+                      <button
+                        className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-900 transition hover:bg-zinc-50"
+                        type="button"
+                        onClick={() => {
+                          if (isProductRow(row.product)) {
+                            onSelectProduct?.(row.product);
+                          }
+                        }}
+                      >
+                        {formatCellValue(row[column.key])}
+                      </button>
+                    ) : (
+                      formatCellValue(row[column.key])
+                    )}
                   </td>
                 ))}
               </tr>

@@ -127,7 +127,17 @@ export type SectionId =
 export type SectionData = {
   title: string;
   columns: Array<{ key: string; label: string }>;
-  rows: Array<Record<string, string | number | string[] | ProductQuotation | null>>;
+  rows: Array<
+    Record<
+      string,
+      | string
+      | number
+      | string[]
+      | ProductQuotation
+      | ProductRow
+      | null
+    >
+  >;
 };
 
 export type ProductQuotation = {

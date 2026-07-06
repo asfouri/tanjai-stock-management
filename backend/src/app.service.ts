@@ -16,12 +16,17 @@ export class AppService {
     return 'Hello World!';
   }
 
-  async getDashboardSection(section: string): Promise<DashboardSection> {
+  async getDashboardSection(
+    section: string,
+    filters: DashboardFilters = {},
+  ): Promise<DashboardSection> {
+    const normalizedFilters = this.normalizeDashboardFilters(filters);
+
     switch (section) {
       case 'products':
         return this.getProductsSection();
       case 'orders':
-        return this.getOrdersSection();
+        return this.getOrdersSection(normalizedFilters);
       case 'inventory':
         return this.getInventorySection();
       case 'stores':
@@ -410,7 +415,6 @@ export class AppService {
         debugCounts,
       };
     } catch (error) {
-      console.error('Dashboard ERP summary failed', error);
       const message = error instanceof Error ? error.message : String(error);
       throw new InternalServerErrorException(
         `Dashboard summary failed: ${message}`,
@@ -535,40 +539,46 @@ export class AppService {
         { key: 'orderLines', label: 'Order lines' },
         { key: 'stockPurchases', label: 'Stock purchases' },
       ],
-      rows: catalogProducts.map((product) => ({
-        id: product.id,
-        name: product.name,
-        description: product.description ?? '',
-        imageUrl: product.imageUrl ?? null,
-        skuAliases: product.skuAliases.map((alias) => alias.sku),
-        quotation:
-          includeQuotation && 'quotation' in product
-            ? (this.normalizeQuotationForResponse(product.quotation) ?? null)
-            : null,
-        stores: [
-          ...new Set(
-            product.skuAliases
-              .map((alias) => alias.store?.name)
-              .filter((store): store is string => Boolean(store)),
-          ),
-        ],
-        skus: product.skuAliases.map((alias) => alias.sku).join(', ') || '-',
-        weight: product.weight ?? null,
-        orderLines: product._count.orderLines,
-        stockPurchases: product._count.stockPurchases,
-        inventoryMovements: product._count.inventoryMovements,
-        currentInventory: this.round(
-          product.inventoryMovements.reduce((total, movement) => {
-            if (movement.movementType === 'snapshot') return total;
-            const sign =
-              movement.movementType === 'consumption' ||
-              movement.movementType === 'used'
-                ? -1
-                : 1;
-            return total + movement.quantity * sign;
-          }, 0),
+      rows: catalogProducts.map((product) =>
+        this.productResponseRow(product, includeQuotation),
+      ),
+    };
+  }
+
+  private productResponseRow(product: any, includeQuotation: boolean) {
+    return {
+      id: product.id,
+      name: product.name,
+      description: product.description ?? '',
+      imageUrl: product.imageUrl ?? null,
+      skuAliases: product.skuAliases.map((alias: any) => alias.sku),
+      quotation:
+        includeQuotation && 'quotation' in product
+          ? (this.normalizeQuotationForResponse(product.quotation) ?? null)
+          : null,
+      stores: [
+        ...new Set(
+          product.skuAliases
+            .map((alias: any) => alias.store?.name)
+            .filter((store: unknown): store is string => Boolean(store)),
         ),
-      })),
+      ],
+      skus: product.skuAliases.map((alias: any) => alias.sku).join(', ') || '-',
+      weight: product.weight ?? null,
+      orderLines: product._count.orderLines,
+      stockPurchases: product._count.stockPurchases,
+      inventoryMovements: product._count.inventoryMovements,
+      currentInventory: this.round(
+        product.inventoryMovements.reduce((total: number, movement: any) => {
+          if (movement.movementType === 'snapshot') return total;
+          const sign =
+            movement.movementType === 'consumption' ||
+            movement.movementType === 'used'
+              ? -1
+              : 1;
+          return total + movement.quantity * sign;
+        }, 0),
+      ),
     };
   }
 
@@ -726,8 +736,78 @@ export class AppService {
     );
   }
 
-  private async getOrdersSection(): Promise<DashboardSection> {
+  private async getOrdersSection(
+    filters: DashboardFilters = {},
+  ): Promise<DashboardSection> {
+    const dateFilter = this.dateFilter(filters.dateFrom, filters.dateTo);
+    const where: Record<string, unknown> = {
+      ...(dateFilter ? { orderDate: dateFilter } : {}),
+      ...(filters.orderNumber
+        ? {
+            externalOrderNumber: {
+              contains: filters.orderNumber,
+              mode: 'insensitive' as const,
+            },
+          }
+        : {}),
+      ...(filters.invoice
+        ? {
+            invoiceReference: {
+              contains: filters.invoice,
+              mode: 'insensitive' as const,
+            },
+          }
+        : {}),
+    };
+
+    if (filters.store) {
+      const stores = await this.prisma.store.findMany({
+        select: { id: true, name: true, normalizedName: true },
+      });
+      const normalizedStore = this.normalizeStoreName(filters.store);
+      const storeIds = stores
+        .filter(
+          (store) =>
+            sameText(store.name, filters.store as string) ||
+            store.normalizedName === normalizedStore,
+        )
+        .map((store) => store.id);
+
+      where.storeId = { in: storeIds };
+    }
+
+    const orderIdSets: string[][] = [];
+    if (filters.sku) {
+      const matchingLines = await this.prisma.orderLine.findMany({
+        where: {
+          sku: { contains: filters.sku, mode: 'insensitive' as const },
+        },
+        select: { orderId: true },
+        take: 10000,
+      });
+      orderIdSets.push(matchingLines.map((line) => line.orderId));
+    }
+    if (filters.trackingNumber) {
+      const matchingShipments = await this.prisma.shipment.findMany({
+        where: {
+          trackingNumber: {
+            contains: filters.trackingNumber,
+            mode: 'insensitive' as const,
+          },
+        },
+        select: { orderId: true },
+        take: 10000,
+      });
+      orderIdSets.push(matchingShipments.map((shipment) => shipment.orderId));
+    }
+
+    const filteredOrderIds = this.intersectIdSets(orderIdSets);
+    if (filteredOrderIds) {
+      where.id = { in: filteredOrderIds };
+    }
+
     const orders = await this.prisma.order.findMany({
+      where,
       orderBy: { createdAt: 'desc' },
       take: 500,
       select: {
@@ -735,31 +815,151 @@ export class AppService {
         orderDate: true,
         invoiceReference: true,
         status: true,
+        sourceSheet: true,
+        sourceRow: true,
         store: { select: { name: true } },
-        _count: { select: { lines: true, shipments: true } },
+        lines: {
+          orderBy: { sourceRow: 'asc' },
+          select: {
+            sku: true,
+            quantity: true,
+            productCost: true,
+            shippingCost: true,
+            handlingCost: true,
+            totalCost: true,
+            lineType: true,
+            sourceSheet: true,
+            sourceRow: true,
+            product: {
+              select: {
+                id: true,
+                name: true,
+                description: true,
+                weight: true,
+                imageUrl: true,
+                skuAliases: {
+                  select: { sku: true, store: { select: { name: true } } },
+                  orderBy: { sku: 'asc' },
+                },
+                _count: {
+                  select: {
+                    orderLines: true,
+                    stockPurchases: true,
+                    inventoryMovements: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+        shipments: {
+          orderBy: { trackingNumber: 'asc' },
+          select: { trackingNumber: true },
+        },
       },
     });
 
     return {
-      title: 'Orders',
+      title: 'Order lines',
       columns: [
         { key: 'orderNumber', label: 'Order number' },
         { key: 'store', label: 'Store' },
         { key: 'invoice', label: 'Invoice' },
         { key: 'status', label: 'Status' },
         { key: 'date', label: 'Date' },
-        { key: 'lines', label: 'Lines' },
-        { key: 'shipments', label: 'Shipments' },
+        { key: 'trackingNumbers', label: 'Tracking' },
+        { key: 'sku', label: 'Product' },
+        { key: 'quantity', label: 'Quantity' },
+        { key: 'productCost', label: 'Product cost' },
+        { key: 'shippingCost', label: 'Shipping cost' },
+        { key: 'handlingCost', label: 'Handling cost' },
+        { key: 'totalCost', label: 'Total cost' },
+        { key: 'lineType', label: 'Line type' },
+        { key: 'sourceSheet', label: 'Source sheet' },
+        { key: 'sourceRow', label: 'Source row' },
       ],
-      rows: orders.map((order) => ({
-        orderNumber: order.externalOrderNumber,
-        store: order.store.name,
-        invoice: order.invoiceReference,
-        status: this.formatLabel(order.status),
-        date: this.formatDateValue(order.orderDate),
-        lines: order._count.lines,
-        shipments: order._count.shipments,
-      })),
+      rows: orders.flatMap((order) => {
+        const trackingNumbers =
+          order.shipments.map((shipment) => shipment.trackingNumber).join(', ') ||
+          '-';
+        const baseRow = {
+          orderNumber: order.externalOrderNumber,
+          store: order.store.name,
+          invoice: order.invoiceReference,
+          status: this.formatLabel(order.status),
+          date: this.formatDateValue(order.orderDate),
+          trackingNumbers,
+        };
+
+        if (order.lines.length === 0) {
+          return [
+            {
+              ...baseRow,
+              sku: '-',
+              quantity: 0,
+              productCost: 0,
+              shippingCost: 0,
+              handlingCost: 0,
+              totalCost: 0,
+              lineType: '-',
+              sourceSheet: order.sourceSheet,
+              sourceRow: order.sourceRow,
+            },
+          ];
+        }
+
+        return order.lines.map((line) => ({
+          ...baseRow,
+          sku: line.sku,
+          quantity: line.quantity,
+          productCost: this.round(line.productCost),
+          shippingCost: this.round(line.shippingCost),
+          handlingCost: this.round(line.handlingCost),
+          totalCost: this.round(line.totalCost),
+          lineType: this.formatLabel(line.lineType),
+          sourceSheet: line.sourceSheet,
+          sourceRow: line.sourceRow,
+          product: line.product
+            ? this.productSummaryResponseRow(line.product)
+            : {
+                name: line.sku,
+                description: 'No linked product details were found for this SKU.',
+                imageUrl: null,
+                skuAliases: [line.sku],
+                stores: [order.store.name],
+                skus: line.sku,
+                weight: null,
+                orderLines: 0,
+                stockPurchases: 0,
+                inventoryMovements: 0,
+                currentInventory: 0,
+                quotation: null,
+              },
+        }));
+      }),
+    };
+  }
+
+  private productSummaryResponseRow(product: any) {
+    return {
+      id: product.id,
+      name: product.name,
+      description: product.description ?? '',
+      imageUrl: product.imageUrl ?? null,
+      skuAliases: product.skuAliases.map((alias: any) => alias.sku),
+      stores: [
+        ...new Set(
+          product.skuAliases
+            .map((alias: any) => alias.store?.name)
+            .filter((store: unknown): store is string => Boolean(store)),
+        ),
+      ],
+      skus: product.skuAliases.map((alias: any) => alias.sku).join(', ') || '-',
+      weight: product.weight ?? null,
+      orderLines: product._count.orderLines,
+      stockPurchases: product._count.stockPurchases,
+      inventoryMovements: product._count.inventoryMovements,
+      quotation: null,
     };
   }
 
