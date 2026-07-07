@@ -1151,6 +1151,7 @@ export class ExcelImportService {
   ) {
     let lastProductName = '';
     let lastProductImageUrl: string | undefined;
+    let skipAlternateLayout = false;
     const seenSkuNames = new Map<string, string>();
     const imageByRow =
       sheet.name === 'Quotation-NEW'
@@ -1170,6 +1171,21 @@ export class ExcelImportService {
 
     for (const row of sheet.rows) {
       if (row.rowNumber <= 4) continue;
+
+      const headerLayout = this.quotationHeaderLayout(row);
+      if (headerLayout) {
+        skipAlternateLayout = headerLayout === 'alternate';
+        if (skipAlternateLayout) {
+          parsed.warnings.push({
+            sourceSheet: sheet.name,
+            sourceRow: row.rowNumber,
+            severity: 'warning',
+            message: `Skipped secondary quotation table starting at row ${row.rowNumber} because its columns do not match the main quotation layout.`,
+          });
+        }
+        continue;
+      }
+      if (skipAlternateLayout) continue;
 
       const skus = splitSkuAliases(row.cells[4]);
       const rawName = cleanText(row.cells[1]) || cleanText(row.cells[3]);
@@ -1309,6 +1325,23 @@ export class ExcelImportService {
           haystack.includes(candidate) || candidate.includes(haystack),
       );
     });
+  }
+
+  private quotationHeaderLayout(
+    row: WorkbookRow,
+  ): 'standard' | 'alternate' | null {
+    if (
+      normalizeText(row.cells[1]) !== 'no.' ||
+      normalizeText(row.cells[2]) !== 'picture' ||
+      normalizeText(row.cells[3]) !== 'details'
+    ) {
+      return null;
+    }
+
+    const standard =
+      normalizeText(row.cells[12]).includes('service fee') &&
+      normalizeText(row.cells[13]).includes('total cost');
+    return standard ? 'standard' : 'alternate';
   }
 
   private quotationImagesByRow(images: WorkbookImage[]) {
@@ -2081,7 +2114,7 @@ export class ExcelImportService {
         existingBySku.quotation,
         product.quotation,
       );
-      existingBySku.imageUrl = product.imageUrl ?? existingBySku.imageUrl;
+      existingBySku.imageUrl = existingBySku.imageUrl ?? product.imageUrl;
       if (
         product.source === 'quotation' &&
         normalizeProductName(existingBySku.name) === normalizeProductName(sku)
@@ -2102,13 +2135,13 @@ export class ExcelImportService {
 
     if (existingByName && !sku) {
       existingByName.description =
-        product.description ?? existingByName.description;
-      existingByName.weight = product.weight ?? existingByName.weight;
+        existingByName.description ?? product.description;
+      existingByName.weight = existingByName.weight ?? product.weight;
       existingByName.quotation = mergeProductQuotation(
         existingByName.quotation,
         product.quotation,
       );
-      existingByName.imageUrl = product.imageUrl ?? existingByName.imageUrl;
+      existingByName.imageUrl = existingByName.imageUrl ?? product.imageUrl;
       return;
     }
 
@@ -2578,7 +2611,9 @@ function mergeProductQuotation(
   if (!existing) return next;
   if (!next) return existing;
 
-  const merged: QuotationData = { ...existing, ...next };
+  // First row wins for scalar fields (base offer, usually quantity 1);
+  // later quantity-tier rows only fill gaps and extend the arrays below.
+  const merged: QuotationData = { ...next, ...existing };
   merged.quantityConditions = uniqueStrings([
     ...(existing.quantityConditions ?? []),
     ...(next.quantityConditions ?? []),

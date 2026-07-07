@@ -17,7 +17,13 @@ import {
   YAxis,
 } from "recharts";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
-import { apiBaseUrl, apiFetch, responseErrorMessage } from "./api";
+import {
+  apiBaseUrl,
+  apiFetch,
+  getSessionWithTimeout,
+  responseErrorMessage,
+  setCachedAccessToken,
+} from "./api";
 import { FilterInput, FilterSelect } from "./components/FilterBar";
 import { EmptyState, Panel } from "./components/Panel";
 import { ProductImage } from "./components/ProductImage";
@@ -149,19 +155,19 @@ export default function DashboardPage() {
 
     async function loadDashboard() {
       try {
-        const supabase = getSupabaseBrowserClient();
-        const { data, error } = await supabase.auth.getUser();
+        const sessionResponse = await getSessionWithTimeout();
+        const session = sessionResponse?.data.session;
 
-        if (error || !data.user) {
-          router.replace("/login");
-          return;
-        }
-
-        if (isMounted) setUser(data.user);
+        if (isMounted) setUser(session?.user ?? null);
 
         const response = await apiFetch(
           `${apiBaseUrl}/dashboard/summary${filterQuery ? `?${filterQuery}` : ""}`,
         );
+
+        if (response.status === 401) {
+          router.replace("/login");
+          return;
+        }
 
         if (!response.ok) {
           throw new Error(
@@ -222,6 +228,7 @@ export default function DashboardPage() {
           const data = (await response.json()) as ImportBatchRow[];
           if (isMounted) {
             setImportBatches(data);
+            loadedSectionQueryRef.current.imports = sectionQuery;
             setLoadedSectionCache((cache) => ({ ...cache, imports: true }));
           }
           return;
@@ -298,6 +305,8 @@ export default function DashboardPage() {
     setErrorMessage("");
     const supabase = getSupabaseBrowserClient();
     await supabase.auth.signOut();
+    setCachedAccessToken("");
+    await fetch("/api/logout", { method: "POST" }).catch(() => null);
     router.replace("/login");
     router.refresh();
   }

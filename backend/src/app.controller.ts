@@ -9,6 +9,7 @@ import {
   Query,
   Req,
   UseGuards,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { AppService } from './app.service';
 import { SupabaseAuthGuard } from './auth/supabase-auth.guard';
@@ -25,6 +26,24 @@ export class AppController {
   @Get()
   getHello(): string {
     return this.appService.getHello();
+  }
+
+  @Post('auth/login')
+  login(
+    @Body('email') email: string | undefined,
+    @Body('password') password: string | undefined,
+  ) {
+    const user = getDevUser(email, password);
+
+    if (!user) {
+      throw new UnauthorizedException('Invalid email or password.');
+    }
+
+    return {
+      accessToken: `local-dev:${user.email}`,
+      expiresIn: 24 * 60 * 60,
+      user: { email: user.email, role: user.role },
+    };
   }
 
   @Get('dashboard/summary')
@@ -90,6 +109,34 @@ export class AppController {
   ) {
     return this.excelImportService.replaceImportBatch(importBatchId, token);
   }
+}
+
+function getDevUser(email: string | undefined, password: string | undefined) {
+  const normalizedEmail = (email ?? '').trim().toLowerCase();
+  const candidates = [
+    {
+      email: process.env.TANJAI_ADMIN_EMAIL,
+      password: process.env.TANJAI_ADMIN_PASSWORD,
+      role: 'TANJAI_ADMIN',
+    },
+    {
+      email: process.env.BRAND_OWNER_EMAIL,
+      password: process.env.BRAND_OWNER_PASSWORD,
+      role: 'BRAND_OWNER',
+    },
+    {
+      email: process.env.UFULFILL_EMAIL,
+      password: process.env.UFULFILL_PASSWORD,
+      role: 'UFULFILL',
+    },
+  ];
+
+  return candidates.find(
+    (candidate) =>
+      candidate.email?.toLowerCase() === normalizedEmail &&
+      candidate.password &&
+      candidate.password === password,
+  );
 }
 
 function readRequestBuffer(
