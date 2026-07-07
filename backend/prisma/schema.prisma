@@ -1,0 +1,266 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  schemas  = ["public"]
+}
+
+model ImportBatch {
+  id         String   @id @default(uuid())
+  fileName   String
+  fileHash   String   @unique
+  status     String   @default("CONFIRMED")
+  summary    Json
+  warnings   Json
+  duplicates Json
+  createdAt  DateTime @default(now())
+
+  orders              Order[]
+  fulfillmentInvoices FulfillmentInvoice[]
+  stockPurchases      StockPurchase[]
+  inventoryMovements  InventoryMovement[]
+  walletTransactions  WalletTransaction[]
+  anomalies           Anomaly[]
+
+  @@map("excel_import_batches")
+  @@schema("public")
+}
+
+model Brand {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  createdAt DateTime @default(now())
+
+  stores Store[]
+
+  @@map("excel_brands")
+  @@schema("public")
+}
+
+model Store {
+  id             String   @id @default(uuid())
+  brandId        String
+  name           String
+  normalizedName String
+  country        String?
+  platform       String?
+  createdAt      DateTime @default(now())
+
+  brand Brand @relation(fields: [brandId], references: [id])
+
+  skuAliases          ProductSkuAlias[]
+  orders              Order[]
+  fulfillmentInvoices FulfillmentInvoice[]
+  inventoryMovements  InventoryMovement[]
+  walletTransactions  WalletTransaction[]
+
+  @@unique([brandId, normalizedName])
+  @@index([normalizedName])
+  @@map("excel_stores")
+  @@schema("public")
+}
+
+model Product {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  weight      Float?
+  quotation   Json?
+  imageUrl    String?
+  createdAt   DateTime @default(now())
+
+  skuAliases         ProductSkuAlias[]
+  orderLines         OrderLine[]
+  stockPurchases     StockPurchase[]
+  inventoryMovements InventoryMovement[]
+
+  @@unique([name])
+  @@map("excel_products")
+  @@schema("public")
+}
+
+model ProductSkuAlias {
+  id        String   @id @default(uuid())
+  productId String
+  storeId   String?
+  sku       String
+  createdAt DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id])
+  store   Store?  @relation(fields: [storeId], references: [id])
+
+  @@unique([sku])
+  @@index([sku])
+  @@map("excel_product_sku_aliases")
+  @@schema("public")
+}
+
+model Order {
+  id                  String    @id @default(uuid())
+  importBatchId       String
+  storeId             String
+  externalOrderNumber String
+  orderDate           DateTime?
+  invoiceReference    String
+  status              String    @default("CONFIRMED")
+  sourceSheet         String
+  sourceRow           Int
+  createdAt           DateTime  @default(now())
+
+  importBatch ImportBatch @relation(fields: [importBatchId], references: [id])
+  store       Store       @relation(fields: [storeId], references: [id])
+
+  lines     OrderLine[]
+  shipments Shipment[]
+
+  @@unique([storeId, externalOrderNumber, invoiceReference])
+  @@index([externalOrderNumber])
+  @@map("excel_orders")
+  @@schema("public")
+}
+
+model OrderLine {
+  id           String @id @default(uuid())
+  orderId      String
+  productId    String?
+  sku          String
+  quantity     Float
+  productCost  Float  @default(0)
+  shippingCost Float  @default(0)
+  handlingCost Float  @default(0)
+  totalCost    Float  @default(0)
+  lineType     String @default("product")
+  sourceSheet  String
+  sourceRow    Int
+
+  order   Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id])
+
+  @@index([sku])
+  @@map("excel_order_lines")
+  @@schema("public")
+}
+
+model Shipment {
+  id             String @id @default(uuid())
+  orderId        String
+  trackingNumber String
+  sourceSheet    String
+  sourceRow      Int
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId, trackingNumber])
+  @@index([trackingNumber])
+  @@map("excel_shipments")
+  @@schema("public")
+}
+
+model FulfillmentInvoice {
+  id               String    @id @default(uuid())
+  importBatchId    String
+  storeId          String
+  invoiceReference String
+  invoiceDate      DateTime?
+  subtotal         Float     @default(0)
+  refunds          Float     @default(0)
+  adjustments      Float     @default(0)
+  otherCost        Float     @default(0)
+  total            Float     @default(0)
+  sourceSheet      String
+  sourceRow        Int
+  createdAt        DateTime  @default(now())
+
+  importBatch ImportBatch @relation(fields: [importBatchId], references: [id])
+  store       Store       @relation(fields: [storeId], references: [id])
+
+  @@unique([storeId, invoiceReference])
+  @@index([invoiceDate])
+  @@map("excel_fulfillment_invoices")
+  @@schema("public")
+}
+
+model StockPurchase {
+  id            String    @id @default(uuid())
+  importBatchId String
+  productId     String?
+  purchaseDate  DateTime?
+  sku           String?
+  quantity      Float
+  unitCost      Float?
+  totalCost     Float
+  sourceSheet   String
+  sourceRow     Int
+  createdAt     DateTime  @default(now())
+
+  importBatch ImportBatch @relation(fields: [importBatchId], references: [id])
+  product     Product?    @relation(fields: [productId], references: [id])
+
+  @@index([sku])
+  @@map("excel_stock_purchases")
+  @@schema("public")
+}
+
+model InventoryMovement {
+  id            String    @id @default(uuid())
+  importBatchId String
+  productId     String?
+  storeId       String?
+  movementDate  DateTime?
+  movementType  String
+  quantity      Float
+  reference     String?
+  comment       String?
+  sourceSheet   String
+  sourceRow     Int
+  createdAt     DateTime  @default(now())
+
+  importBatch ImportBatch @relation(fields: [importBatchId], references: [id])
+  product     Product?    @relation(fields: [productId], references: [id])
+  store       Store?      @relation(fields: [storeId], references: [id])
+
+  @@index([movementType])
+  @@map("excel_inventory_movements")
+  @@schema("public")
+}
+
+model WalletTransaction {
+  id               String    @id @default(uuid())
+  importBatchId    String
+  storeId          String?
+  transactionDate  DateTime?
+  transactionType  String
+  invoiceReference String?
+  amount           Float
+  runningBalance   Float?
+  exchangeRate     Float?
+  sourceSheet      String
+  sourceRow        Int
+  createdAt        DateTime  @default(now())
+
+  importBatch ImportBatch @relation(fields: [importBatchId], references: [id])
+  store       Store?      @relation(fields: [storeId], references: [id])
+
+  @@index([invoiceReference])
+  @@index([transactionDate])
+  @@map("excel_wallet_transactions")
+  @@schema("public")
+}
+
+model Anomaly {
+  id            String   @id @default(uuid())
+  importBatchId String?
+  severity      String
+  message       String
+  sourceSheet   String?
+  sourceRow     Int?
+  createdAt     DateTime @default(now())
+
+  importBatch ImportBatch? @relation(fields: [importBatchId], references: [id])
+
+  @@map("excel_anomalies")
+  @@schema("public")
+}

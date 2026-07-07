@@ -26,6 +26,12 @@ yarn-error.log*
 .idea/
 .vscode/*
 !.vscode/extensions.json
+.claude/
+
+# Local Excel workbooks used for manual import checks
+*.xlsx
+*.xls
+*.xlsm
 
 # Testing
 coverage/

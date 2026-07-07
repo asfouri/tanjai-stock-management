@@ -1,101 +1,2033 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { User } from "@supabase/supabase-js";
+import {
+  Bar,
+  BarChart,
+  Cell,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import {
+  apiBaseUrl,
+  apiFetch,
+  getSessionWithTimeout,
+  responseErrorMessage,
+  setCachedAccessToken,
+} from "./api";
+import { FilterInput, FilterSelect } from "./components/FilterBar";
+import { EmptyState, Panel } from "./components/Panel";
+import { ProductImage } from "./components/ProductImage";
+import type {
+  ChartPoint,
+  DashboardSummary,
+  Filters,
+  ImportBatchRow,
+  ImportPreview,
+  ProductQuotation,
+  ProductRow,
+  QuotationOfferRow,
+  SectionData,
+  SectionId,
+} from "./types";
+import {
+  cleanKeyPart,
+  emptySummary,
+  formatCellValue,
+  formatCurrency,
+  formatDate,
+  formatNumber,
+  getUserDisplayName,
+  normalizeSummary,
+  productRowKey,
+  quotationRowKey,
+  recordRowKey,
+  uniqueByKey,
+  uniqueNonEmptyStrings,
+} from "./utils";
+
+const initialFilters: Filters = {
+  brand: "",
+  store: "",
+  dateFrom: "",
+  dateTo: "",
+  sku: "",
+  invoice: "",
+  orderNumber: "",
+  trackingNumber: "",
+};
+
+const sidebarItems: Array<{ id: SectionId; label: string }> = [
+  { id: "dashboard", label: "Dashboard" },
+  { id: "imports", label: "Imports" },
+  { id: "products", label: "Products" },
+  { id: "orders", label: "Orders" },
+  { id: "inventory", label: "Inventory" },
+  { id: "stores", label: "Stores" },
+  { id: "invoices", label: "Invoices" },
+  { id: "payments", label: "Payments" },
+];
+
+const chartColors = ["#18181b", "#0f766e", "#b45309", "#991b1b", "#52525b"];
+
+type CachedSectionId = Exclude<SectionId, "dashboard" | "imports">;
+type SectionDataCache = Partial<Record<CachedSectionId, SectionData>>;
+type LoadedSectionCache = Partial<Record<Exclude<SectionId, "dashboard">, true>>;
 
 export default function DashboardPage() {
   const router = useRouter();
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const loadedSectionQueryRef = useRef<Partial<Record<SectionId, string>>>({});
   const [user, setUser] = useState<User | null>(null);
+  const [activeSection, setActiveSection] = useState<SectionId>("dashboard");
+  const [summary, setSummary] = useState<DashboardSummary>(emptySummary);
+  const [sectionDataCache, setSectionDataCache] = useState<SectionDataCache>({});
+  const [loadedSectionCache, setLoadedSectionCache] =
+    useState<LoadedSectionCache>({});
+  const [importBatches, setImportBatches] = useState<ImportBatchRow[]>([]);
+  const [productSearch, setProductSearch] = useState("");
+  const [productPage, setProductPage] = useState(1);
+  const [selectedProduct, setSelectedProduct] = useState<ProductRow | null>(null);
+  const [selectedImportAction, setSelectedImportAction] = useState<{
+    batch: ImportBatchRow;
+    mode: "remove" | "replace";
+  } | null>(null);
+  const [filters, setFilters] = useState<Filters>(initialFilters);
   const [isLoading, setIsLoading] = useState(true);
-  const [message, setMessage] = useState("");
+  const [loadingSection, setLoadingSection] = useState<SectionId | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
+  const [isRemovingImport, setIsRemovingImport] = useState(false);
+  const [preview, setPreview] = useState<ImportPreview | null>(null);
+  const [errorMessage, setErrorMessage] = useState("");
+  const [importErrorMessage, setImportErrorMessage] = useState("");
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  const sectionData =
+    activeSection !== "dashboard" && activeSection !== "imports"
+      ? (sectionDataCache[activeSection] ?? null)
+      : null;
+  const isSectionLoading = loadingSection === activeSection;
+
+  const filterQuery = useMemo(() => {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(filters)) {
+      if (value.trim()) params.set(key, value.trim());
+    }
+    return params.toString();
+  }, [filters]);
+
+  const orderSectionQuery = useMemo(() => {
+    const params = new URLSearchParams();
+    for (const key of [
+      "store",
+      "dateFrom",
+      "dateTo",
+      "orderNumber",
+      "invoice",
+      "sku",
+      "trackingNumber",
+    ] as const) {
+      const value = filters[key].trim();
+      if (value) params.set(key, value);
+    }
+    return params.toString();
+  }, [
+    filters.store,
+    filters.dateFrom,
+    filters.dateTo,
+    filters.orderNumber,
+    filters.invoice,
+    filters.sku,
+    filters.trackingNumber,
+  ]);
 
   useEffect(() => {
     let isMounted = true;
 
-    async function loadSession() {
+    async function loadDashboard() {
       try {
-        const supabase = getSupabaseBrowserClient();
-        const { data, error } = await supabase.auth.getUser();
+        const sessionResponse = await getSessionWithTimeout();
+        const session = sessionResponse?.data.session;
 
-        if (error || !data.user) {
+        if (isMounted) setUser(session?.user ?? null);
+
+        const response = await apiFetch(
+          `${apiBaseUrl}/dashboard/summary${filterQuery ? `?${filterQuery}` : ""}`,
+        );
+
+        if (response.status === 401) {
           router.replace("/login");
           return;
         }
 
-        if (isMounted) {
-          setUser(data.user);
-          setIsLoading(false);
+        if (!response.ok) {
+          throw new Error(
+            await responseErrorMessage(response, "Unable to load dashboard summary.")
+          );
         }
+
+        const dashboardSummary =
+          (await response.json()) as Partial<DashboardSummary>;
+
+        if (isMounted) setSummary(normalizeSummary(dashboardSummary));
       } catch (error) {
         if (isMounted) {
-          setMessage(
-            error instanceof Error
-              ? error.message
-              : "Unable to verify your session."
+          setErrorMessage(
+            error instanceof Error ? error.message : "Unable to load dashboard."
           );
-          setIsLoading(false);
         }
+      } finally {
+        if (isMounted) setIsLoading(false);
       }
     }
 
-    loadSession();
+    loadDashboard();
 
     return () => {
       isMounted = false;
     };
-  }, [router]);
+  }, [filterQuery, router, refreshKey]);
+
+  useEffect(() => {
+    if (activeSection === "dashboard") {
+      return;
+    }
+
+    const sectionQuery = activeSection === "orders" ? orderSectionQuery : "";
+
+    if (
+      loadedSectionCache[activeSection] &&
+      loadedSectionQueryRef.current[activeSection] === sectionQuery
+    ) {
+      return;
+    }
+
+    let isMounted = true;
+
+    async function loadSection() {
+      setLoadingSection(activeSection);
+      setErrorMessage("");
+
+      try {
+        if (activeSection === "imports") {
+          const response = await apiFetch(`${apiBaseUrl}/imports/excel/history`);
+          if (!response.ok) {
+            throw new Error(
+              await responseErrorMessage(response, "Unable to load import history.")
+            );
+          }
+          const data = (await response.json()) as ImportBatchRow[];
+          if (isMounted) {
+            setImportBatches(data);
+            loadedSectionQueryRef.current.imports = sectionQuery;
+            setLoadedSectionCache((cache) => ({ ...cache, imports: true }));
+          }
+          return;
+        }
+
+        const response = await apiFetch(
+          `${apiBaseUrl}/dashboard/section/${activeSection}${
+            sectionQuery ? `?${sectionQuery}` : ""
+          }`
+        );
+
+        if (!response.ok) {
+          throw new Error(
+            await responseErrorMessage(response, "Unable to load section data.")
+          );
+        }
+
+        const data = (await response.json()) as SectionData;
+        if (isMounted) {
+          setSectionDataCache((cache) => ({
+            ...cache,
+            [activeSection]: data,
+          }));
+          loadedSectionQueryRef.current[activeSection] = sectionQuery;
+          setLoadedSectionCache((cache) => ({
+            ...cache,
+            [activeSection]: true,
+          }));
+        }
+      } catch (error) {
+        if (isMounted) {
+          setErrorMessage(
+            error instanceof Error ? error.message : "Unable to load section."
+          );
+        }
+      } finally {
+        if (isMounted) {
+          setLoadingSection((section) =>
+            section === activeSection ? null : section
+          );
+        }
+      }
+    }
+
+    loadSection();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [activeSection, loadedSectionCache, orderSectionQuery, refreshKey]);
+
+  async function refreshDashboard() {
+    setIsLoading(true);
+    const response = await apiFetch(
+      `${apiBaseUrl}/dashboard/summary${filterQuery ? `?${filterQuery}` : ""}`
+    );
+    if (response.ok) {
+      setSummary(normalizeSummary(await response.json()));
+    } else {
+      setErrorMessage(
+        await responseErrorMessage(response, "Unable to load dashboard summary.")
+      );
+    }
+    setIsLoading(false);
+  }
+
+  function invalidateSectionCache() {
+    setSectionDataCache({});
+    setLoadedSectionCache({});
+    loadedSectionQueryRef.current = {};
+  }
 
   async function handleLogout() {
-    setMessage("");
+    setErrorMessage("");
+    const supabase = getSupabaseBrowserClient();
+    await supabase.auth.signOut();
+    setCachedAccessToken("");
+    await fetch("/api/logout", { method: "POST" }).catch(() => null);
+    router.replace("/login");
+    router.refresh();
+  }
+
+  async function handleUpload(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    if (!file.name.toLowerCase().endsWith(".xlsx")) {
+      setErrorMessage("Only .xlsx files can be uploaded.");
+      return;
+    }
+
+    setIsImporting(true);
+    setErrorMessage("");
 
     try {
-      const supabase = getSupabaseBrowserClient();
-      await supabase.auth.signOut();
-      router.replace("/login");
-      router.refresh();
+      const response = await apiFetch(`${apiBaseUrl}/imports/excel/preview`, {
+        method: "POST",
+        headers: {
+          "Content-Type":
+            file.type ||
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "x-file-name": encodeURIComponent(file.name),
+        },
+        body: file,
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.message ?? "Unable to parse Excel file.");
+      }
+
+      setImportErrorMessage("");
+      setPreview((await response.json()) as ImportPreview);
     } catch (error) {
-      setMessage(
-        error instanceof Error ? error.message : "Unable to sign out right now."
+      setErrorMessage(
+        error instanceof Error ? error.message : "Unable to upload Excel file."
       );
+    } finally {
+      setIsImporting(false);
     }
   }
 
-  if (isLoading) {
-    return (
-      <main className="flex min-h-screen items-center justify-center bg-zinc-50 px-6 text-sm text-zinc-600">
-        Loading dashboard...
-      </main>
-    );
+  async function confirmImport() {
+    if (!preview) return;
+
+    setIsImporting(true);
+    setImportErrorMessage("");
+
+    try {
+      const response = await apiFetch(`${apiBaseUrl}/imports/excel/confirm`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: preview.token }),
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.message ?? "Unable to save import.");
+      }
+
+      setPreview(null);
+      invalidateSectionCache();
+      await refreshDashboard();
+      setRefreshKey((value) => value + 1);
+    } catch (error) {
+      setImportErrorMessage(
+        error instanceof Error ? error.message : "Unable to confirm import."
+      );
+    } finally {
+      setIsImporting(false);
+    }
   }
 
+  async function confirmImportAction() {
+    if (!selectedImportAction) return;
+
+    setIsRemovingImport(true);
+    setErrorMessage("");
+
+    try {
+      const response = await apiFetch(`${apiBaseUrl}/imports/excel/remove`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ importBatchId: selectedImportAction.batch.id }),
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.message ?? "Unable to remove import.");
+      }
+
+      const shouldOpenUpload = selectedImportAction.mode === "replace";
+      setSelectedImportAction(null);
+      invalidateSectionCache();
+      await refreshDashboard();
+      setRefreshKey((value) => value + 1);
+
+      if (shouldOpenUpload) {
+        window.setTimeout(() => fileInputRef.current?.click(), 0);
+      }
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Unable to remove import."
+      );
+    } finally {
+      setIsRemovingImport(false);
+    }
+  }
+
+  const cards = [
+    ["Orders", formatNumber(summary.totalOrders)],
+    ["Shipments", formatNumber(summary.totalShipments)],
+    ["Invoices", formatNumber(summary.totalInvoices)],
+    ["Total costs", formatCurrency(summary.totalCosts)],
+    ["Current balance", formatCurrency(summary.currentBalance)],
+    ["Anomalies", formatNumber(summary.anomaliesDetected)],
+  ];
+
   return (
-    <main className="min-h-screen bg-zinc-50 px-6 py-8 text-zinc-950">
-      <section className="mx-auto flex w-full max-w-4xl items-center justify-between gap-4 border-b border-zinc-200 pb-5">
-        <div>
-          <p className="text-sm font-medium text-zinc-500">TanjAI Stock</p>
-          <h1 className="mt-1 text-2xl font-semibold">Dashboard</h1>
-        </div>
+    <main className="min-h-screen bg-zinc-50 text-zinc-950">
+      <aside className="fixed inset-y-0 left-0 hidden w-64 flex-col border-r border-zinc-200 bg-white px-5 py-6 md:flex">
+        <div className="text-lg font-semibold">TanjAI Stock</div>
+        <nav className="mt-8 space-y-1" aria-label="Dashboard sections">
+          {sidebarItems.map((item) => {
+            const isActive = item.id === activeSection;
+
+            return (
+              <button
+                className={`h-10 w-full rounded-md px-3 text-left text-sm font-medium transition ${
+                  isActive
+                    ? "bg-zinc-950 text-white"
+                    : "text-zinc-600 hover:bg-zinc-100 hover:text-zinc-950"
+                }`}
+                key={item.id}
+                type="button"
+                onClick={() => setActiveSection(item.id)}
+              >
+                {item.label}
+              </button>
+            );
+          })}
+        </nav>
         <button
-          className="h-10 rounded-md border border-zinc-300 bg-white px-4 text-sm font-medium transition hover:bg-zinc-100"
+          className="mt-auto h-10 rounded-md border border-zinc-300 text-sm font-medium transition hover:bg-zinc-50"
           type="button"
           onClick={handleLogout}
         >
           Logout
         </button>
-      </section>
+      </aside>
 
-      <section className="mx-auto mt-8 w-full max-w-4xl rounded-lg border border-zinc-200 bg-white p-6 shadow-sm">
-        <p className="text-sm text-zinc-500">Signed in as</p>
-        <p className="mt-2 text-lg font-medium">{user?.email}</p>
+      <div className="min-w-0 md:pl-64">
+        <header className="sticky top-0 z-10 border-b border-zinc-200 bg-white/95 px-5 py-4 backdrop-blur md:px-8">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-zinc-500 md:hidden">
+                TanjAI Stock
+              </p>
+              <h1 className="text-2xl font-semibold">
+                {sidebarItems.find((item) => item.id === activeSection)?.label ??
+                  "Dashboard"}
+              </h1>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <p className="truncate text-sm text-zinc-600">
+                {getUserDisplayName(user)}
+              </p>
+              <input
+                ref={fileInputRef}
+                hidden
+                accept=".xlsx"
+                type="file"
+                onChange={handleUpload}
+              />
+              <button
+                className="h-10 rounded-md bg-zinc-950 px-4 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
+                type="button"
+                disabled={isImporting}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                {isImporting ? "Processing..." : "Upload Excel"}
+              </button>
+              <button
+                className="h-10 rounded-md border border-zinc-300 bg-white px-4 text-sm font-medium transition hover:bg-zinc-50 md:hidden"
+                type="button"
+                onClick={handleLogout}
+              >
+                Logout
+              </button>
+            </div>
+          </div>
+        </header>
 
-        {message ? (
-          <p className="mt-5 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">
-            {message}
-          </p>
-        ) : null}
-      </section>
+        <section className="min-w-0 space-y-5 px-5 py-6 md:px-8">
+          {errorMessage ? (
+            <div className="rounded-lg border border-red-200 bg-red-50 p-5 text-sm text-red-700">
+              {errorMessage}
+            </div>
+          ) : null}
+
+          {activeSection === "dashboard" ? (
+            <>
+              <Panel title="Filters">
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                  <FilterSelect
+                    label="Brand"
+                    placeholder="All brands"
+                    options={summary.filterOptions.brands}
+                    value={filters.brand}
+                    onChange={(value) => setFilters({ ...filters, brand: value })}
+                  />
+                  <FilterSelect
+                    label="Store"
+                    placeholder="All stores"
+                    options={summary.filterOptions.stores}
+                    value={filters.store}
+                    onChange={(value) => setFilters({ ...filters, store: value })}
+                  />
+                  <FilterInput
+                    label="Date from"
+                    type="date"
+                    value={filters.dateFrom}
+                    onChange={(value) =>
+                      setFilters({ ...filters, dateFrom: value })
+                    }
+                  />
+                  <FilterInput
+                    label="Date to"
+                    type="date"
+                    value={filters.dateTo}
+                    onChange={(value) => setFilters({ ...filters, dateTo: value })}
+                  />
+                  <FilterSelect
+                    label="SKU"
+                    placeholder="All SKUs"
+                    options={summary.filterOptions.skus}
+                    value={filters.sku}
+                    onChange={(value) => setFilters({ ...filters, sku: value })}
+                  />
+                  <FilterSelect
+                    label="Invoice"
+                    placeholder="All invoices"
+                    options={summary.filterOptions.invoices}
+                    value={filters.invoice}
+                    onChange={(value) => setFilters({ ...filters, invoice: value })}
+                  />
+                  <FilterInput
+                    label="Order number"
+                    placeholder="Search order number"
+                    value={filters.orderNumber}
+                    onChange={(value) =>
+                      setFilters({ ...filters, orderNumber: value })
+                    }
+                  />
+                  <FilterInput
+                    label="Tracking number"
+                    placeholder="Search tracking number"
+                    value={filters.trackingNumber}
+                    onChange={(value) =>
+                      setFilters({ ...filters, trackingNumber: value })
+                    }
+                  />
+                </div>
+                <div className="mt-4 flex justify-end">
+                  <button
+                    className="h-10 rounded-md border border-zinc-300 px-4 text-sm font-medium transition hover:bg-zinc-50"
+                    type="button"
+                    onClick={() => setFilters(initialFilters)}
+                  >
+                    Clear
+                  </button>
+                </div>
+              </Panel>
+
+              {isLoading ? (
+                <div className="rounded-lg border border-zinc-200 bg-white p-5 text-sm text-zinc-600">
+                  Loading dashboard...
+                </div>
+              ) : (
+                <>
+                  <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
+                    {cards.map(([title, value]) => (
+                      <article
+                        className="rounded-lg border border-zinc-200 bg-white p-5 shadow-sm"
+                        key={title}
+                      >
+                        <p className="text-sm font-medium text-zinc-500">
+                          {title}
+                        </p>
+                        <p className="mt-4 text-2xl font-semibold">{value}</p>
+                      </article>
+                    ))}
+                  </div>
+
+                  <div className="grid gap-5 xl:grid-cols-2">
+                    <Panel title="Orders by date">
+                      <LinePanel
+                        data={summary.ordersOverTime}
+                        empty="No orders yet."
+                      />
+                    </Panel>
+                    <Panel title="Costs by date">
+                      <LinePanel data={summary.costsByDate} empty="No costs yet." />
+                    </Panel>
+                    <Panel title="Orders by store">
+                      <BarPanel
+                        data={summary.ordersByStore}
+                        empty="No store orders yet."
+                      />
+                    </Panel>
+                    <Panel title="Costs by store">
+                      <BarPanel
+                        data={summary.costsByStore}
+                        empty="No store costs yet."
+                      />
+                    </Panel>
+                    <Panel title="Cost distribution">
+                      <PiePanel
+                        data={summary.costDistribution}
+                        empty="No costs yet."
+                      />
+                    </Panel>
+                    <Panel title="Stock by product">
+                      <BarPanel
+                        data={summary.stockByProduct}
+                        empty="No stock movements yet."
+                      />
+                    </Panel>
+                    <Panel title="Cost summary">
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <Metric
+                          label="Product costs"
+                          value={formatCurrency(summary.productCosts)}
+                        />
+                        <Metric
+                          label="Shipping costs"
+                          value={formatCurrency(summary.shippingCosts)}
+                        />
+                        <Metric
+                          label="Handling costs"
+                          value={formatCurrency(summary.handlingCosts)}
+                        />
+                        <Metric
+                          label="Refunds"
+                          value={formatCurrency(summary.refunds)}
+                        />
+                        <Metric
+                          label="Stock status"
+                          value={formatNumber(summary.stockStatus)}
+                        />
+                      </div>
+                    </Panel>
+                    <Panel title="Attention required">
+                      {summary.attentionRequired.length > 0 ? (
+                        <div className="space-y-3">
+                          {summary.attentionRequired.map((item) => (
+                            <div
+                              className="flex items-center justify-between rounded-md border border-zinc-200 px-4 py-3"
+                              key={item.label}
+                            >
+                              <span className="text-sm font-medium">
+                                {item.label}
+                              </span>
+                              <span className="text-sm text-zinc-500">
+                                {item.total}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <EmptyState label="Nothing requires attention." />
+                      )}
+                    </Panel>
+                    <Panel title="Recent activity">
+                      {summary.recentActivity.length > 0 ? (
+                        <div className="divide-y divide-zinc-100">
+                          {summary.recentActivity.map((item) => (
+                            <div
+                              className="flex items-center justify-between gap-4 py-3"
+                              key={item.id}
+                            >
+                              <div>
+                                <p className="text-sm font-medium">{item.title}</p>
+                                <p className="text-xs text-zinc-500">
+                                  {item.type}
+                                </p>
+                              </div>
+                              <p className="text-xs text-zinc-500">
+                                {formatDate(item.createdAt)}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <EmptyState label="No recent activity." />
+                      )}
+                    </Panel>
+                  </div>
+                </>
+              )}
+            </>
+          ) : (
+            activeSection === "imports" ? (
+              <ImportHistorySection
+                imports={importBatches}
+                isLoading={isSectionLoading}
+                onRemove={(batch) =>
+                  setSelectedImportAction({ batch, mode: "remove" })
+                }
+                onReplace={(batch) =>
+                  setSelectedImportAction({ batch, mode: "replace" })
+                }
+              />
+            ) : activeSection === "products" ? (
+              <ProductsSection
+                data={sectionData}
+                isLoading={isSectionLoading}
+                page={productPage}
+                search={productSearch}
+                onPageChange={setProductPage}
+                onSearchChange={(value) => {
+                  setProductSearch(value);
+                  setProductPage(1);
+                }}
+                onSelectProduct={setSelectedProduct}
+              />
+            ) : activeSection === "orders" ? (
+              <div className="flex h-[calc(100vh-9rem)] min-h-[30rem] flex-col gap-3 overflow-hidden">
+                <div className="shrink-0">
+                  <OrderFiltersPanel
+                    filters={filters}
+                    invoices={summary.filterOptions.invoices}
+                    skus={summary.filterOptions.skus}
+                    stores={summary.filterOptions.stores}
+                    onChange={setFilters}
+                  />
+                </div>
+                <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+                  <OrdersSection
+                    data={sectionData}
+                    isLoading={isSectionLoading}
+                    onSelectProduct={setSelectedProduct}
+                  />
+                </div>
+              </div>
+            ) : (
+              <SectionTable
+                data={sectionData}
+                isLoading={isSectionLoading}
+                title={
+                  sidebarItems.find((item) => item.id === activeSection)
+                    ?.label ?? "Section"
+                }
+              />
+            )
+          )}
+        </section>
+      </div>
+
+      {preview ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/40 p-4">
+          <div className="max-h-[90vh] w-full max-w-4xl overflow-auto rounded-lg bg-white p-5 shadow-xl">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">Import preview</h2>
+                <p className="mt-1 text-sm text-zinc-500">{preview.fileName}</p>
+              </div>
+              <button
+                className="h-9 rounded-md border border-zinc-300 px-3 text-sm"
+                type="button"
+                onClick={() => {
+                  setPreview(null);
+                  setImportErrorMessage("");
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+
+            {importErrorMessage ? (
+              <div className="mt-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                {importErrorMessage}
+              </div>
+            ) : null}
+
+            <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <Metric label="Orders" value={formatNumber(preview.counts.orders)} />
+              <Metric label="Invoices" value={formatNumber(preview.counts.invoices)} />
+              <Metric label="Shipments" value={formatNumber(preview.counts.shipments)} />
+              <Metric label="Invoice costs" value={formatCurrency(preview.totals.invoiceCosts)} />
+              <Metric label="Stock movements" value={formatNumber(preview.counts.stockMovements)} />
+              <Metric label="Wallet entries" value={formatNumber(preview.counts.walletTransactions)} />
+              <Metric label="Warnings" value={formatNumber(preview.counts.warnings)} />
+              <Metric label="Duplicates" value={formatNumber(preview.counts.duplicateRecords)} />
+            </div>
+
+            <div className="mt-5 grid gap-5 lg:grid-cols-2">
+              <PreviewList
+                title="Detected sheets"
+                items={preview.detectedSheets.map(
+                  (sheet) =>
+                    `${sheet.name} · ${sheet.type} · ${sheet.rows} rows${
+                      sheet.invoiceBlocks ? ` · ${sheet.invoiceBlocks} invoices` : ""
+                    }`
+                )}
+              />
+              <PreviewList
+                title="Detected stores"
+                items={preview.stores.map((store) => store.name)}
+              />
+              <PreviewList
+                title="Warnings"
+                items={preview.warnings.map(
+                  (item) =>
+                    `${item.sourceSheet} row ${item.sourceRow}: ${item.message}`
+                )}
+              />
+              <PreviewList title="Duplicate records" items={preview.duplicateRecords} />
+            </div>
+
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                className="h-10 rounded-md border border-zinc-300 px-4 text-sm font-medium transition hover:bg-zinc-50"
+                type="button"
+                onClick={() => {
+                  setPreview(null);
+                  setImportErrorMessage("");
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                className="h-10 rounded-md bg-zinc-950 px-4 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
+                type="button"
+                disabled={isImporting}
+                onClick={confirmImport}
+              >
+                Confirm import
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {selectedProduct ? (
+        <ProductDetailsModal
+          product={selectedProduct}
+          onClose={() => setSelectedProduct(null)}
+        />
+      ) : null}
+
+      {selectedImportAction ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/40 p-4">
+          <div className="w-full max-w-lg rounded-lg bg-white p-5 shadow-xl">
+            <h2 className="text-lg font-semibold">
+              {selectedImportAction.mode === "replace"
+                ? "Replace import"
+                : "Remove import"}
+            </h2>
+            <p className="mt-2 text-sm text-zinc-600">
+              This will remove the import batch for{" "}
+              <span className="font-medium text-zinc-950">
+                {selectedImportAction.batch.fileName}
+              </span>
+              . All data created by that import will be removed, including orders,
+              order lines, shipments, invoices, stock purchases, inventory movements,
+              wallet transactions, anomalies, unused product aliases, and catalog data
+              that is not used by another active import.
+            </p>
+            {selectedImportAction.mode === "replace" ? (
+              <p className="mt-3 text-sm text-zinc-600">
+                After removal, the Excel upload picker will open so you can import the
+                corrected file.
+              </p>
+            ) : null}
+            <div className="mt-5 flex justify-end gap-3">
+              <button
+                className="h-10 rounded-md border border-zinc-300 px-4 text-sm font-medium transition hover:bg-zinc-50"
+                disabled={isRemovingImport}
+                type="button"
+                onClick={() => setSelectedImportAction(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="h-10 rounded-md bg-red-700 px-4 text-sm font-medium text-white transition hover:bg-red-800 disabled:cursor-not-allowed disabled:bg-red-300"
+                disabled={isRemovingImport}
+                type="button"
+                onClick={confirmImportAction}
+              >
+                {isRemovingImport
+                  ? "Removing..."
+                  : selectedImportAction.mode === "replace"
+                    ? "Remove and upload"
+                    : "Remove import"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-md border border-zinc-200 px-4 py-3">
+      <p className="text-xs font-medium text-zinc-500">{label}</p>
+      <p className="mt-1 text-lg font-semibold">{value}</p>
+    </div>
+  );
+}
+
+function PreviewList({ title, items }: { title: string; items: string[] }) {
+  const visibleItems = uniqueNonEmptyStrings(items).slice(0, 80);
+
+  return (
+    <section>
+      <h3 className="text-sm font-semibold">{title}</h3>
+      {visibleItems.length > 0 ? (
+        <div className="mt-3 max-h-44 overflow-auto rounded-md border border-zinc-200">
+          {visibleItems.map((item) => (
+            <div className="border-b border-zinc-100 px-3 py-2 text-sm" key={item}>
+              {item}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="mt-3 rounded-md border border-dashed border-zinc-200 p-3 text-sm text-zinc-500">
+          None
+        </p>
+      )}
+    </section>
+  );
+}
+
+function ImportHistorySection({
+  imports,
+  isLoading,
+  onRemove,
+  onReplace,
+}: {
+  imports: ImportBatchRow[];
+  isLoading: boolean;
+  onRemove: (batch: ImportBatchRow) => void;
+  onReplace: (batch: ImportBatchRow) => void;
+}) {
+  const visibleImports = uniqueByKey(imports, (batch) => cleanKeyPart(batch.id) || null);
+
+  if (isLoading) {
+    return (
+      <div className="rounded-lg border border-zinc-200 bg-white p-5 text-sm text-zinc-600">
+        Loading import history...
+      </div>
+    );
+  }
+
+  return (
+    <Panel title={`Import History (${formatNumber(visibleImports.length)})`}>
+      {visibleImports.length === 0 ? (
+        <EmptyState label="No Excel imports found." />
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[1120px] text-left text-sm">
+            <thead>
+              <tr className="border-b border-zinc-200 text-xs uppercase tracking-wide text-zinc-500">
+                <th className="px-3 py-3 font-semibold">File</th>
+                <th className="px-3 py-3 font-semibold">Imported</th>
+                <th className="px-3 py-3 font-semibold">Status</th>
+                <th className="px-3 py-3 text-right font-semibold">Orders</th>
+                <th className="px-3 py-3 text-right font-semibold">Invoices</th>
+                <th className="px-3 py-3 text-right font-semibold">Products</th>
+                <th className="px-3 py-3 text-right font-semibold">Warnings</th>
+                <th className="px-3 py-3 font-semibold">Hash</th>
+                <th className="px-3 py-3 text-right font-semibold">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-100">
+              {visibleImports.map((batch) => (
+                <tr className="align-top hover:bg-zinc-50" key={batch.id}>
+                  <td className="px-3 py-3">
+                    <p className="font-medium text-zinc-900">{batch.fileName}</p>
+                    <p className="mt-1 text-xs text-zinc-500">{batch.id}</p>
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-3 text-zinc-700">
+                    {formatDate(batch.importedAt)}
+                  </td>
+                  <td className="px-3 py-3">
+                    <span className="rounded-full bg-zinc-100 px-2 py-1 text-xs font-medium text-zinc-700">
+                      {batch.status || "Unknown"}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 text-right tabular-nums">
+                    {formatNumber(batch.orders ?? 0)}
+                  </td>
+                  <td className="px-3 py-3 text-right tabular-nums">
+                    {formatNumber(batch.invoices ?? 0)}
+                  </td>
+                  <td className="px-3 py-3 text-right tabular-nums">
+                    {formatNumber(batch.products ?? 0)}
+                  </td>
+                  <td className="px-3 py-3 text-right tabular-nums">
+                    {formatNumber(batch.warnings ?? 0)}
+                  </td>
+                  <td className="px-3 py-3">
+                    <p className="text-xs font-medium text-zinc-700">
+                      {batch.fileHashStatus}
+                    </p>
+                    <p className="mt-1 max-w-[11rem] truncate font-mono text-xs text-zinc-500">
+                      {batch.fileHash}
+                    </p>
+                  </td>
+                  <td className="px-3 py-3">
+                    <div className="flex justify-end gap-2">
+                      <button
+                        className="h-8 rounded-md border border-zinc-300 px-3 text-xs font-medium transition hover:bg-white"
+                        type="button"
+                        onClick={() => onReplace(batch)}
+                      >
+                        Replace
+                      </button>
+                      <button
+                        className="h-8 rounded-md border border-red-200 px-3 text-xs font-medium text-red-700 transition hover:bg-red-50"
+                        type="button"
+                        onClick={() => onRemove(batch)}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function ProductsSection({
+  data,
+  isLoading,
+  page,
+  search,
+  onPageChange,
+  onSearchChange,
+  onSelectProduct,
+}: {
+  data: SectionData | null;
+  isLoading: boolean;
+  page: number;
+  search: string;
+  onPageChange: (page: number) => void;
+  onSearchChange: (value: string) => void;
+  onSelectProduct: (product: ProductRow) => void;
+}) {
+  const pageSize = 25;
+  const products = uniqueByKey(
+    ((data?.rows ?? []) as unknown as ProductRow[]).map((product) => ({
+      ...product,
+      name: cleanKeyPart(product.name),
+      skuAliases: uniqueNonEmptyStrings(product.skuAliases),
+      stores: uniqueNonEmptyStrings(product.stores),
+    })),
+    productRowKey,
+  );
+  const query = search.trim().toLowerCase();
+  const filteredProducts = products.filter((product) => {
+    const productName = cleanKeyPart(product.name).toLowerCase();
+    if (!query) return true;
+    return (
+      productName.includes(query) ||
+      (product.skuAliases ?? []).some((sku) => sku.toLowerCase().includes(query))
+    );
+  });
+  const pageCount = Math.max(1, Math.ceil(filteredProducts.length / pageSize));
+  const currentPage = Math.min(page, pageCount);
+  const visibleProducts = filteredProducts.slice(
+    (currentPage - 1) * pageSize,
+    currentPage * pageSize,
+  );
+
+  if (isLoading) {
+    return (
+      <div className="rounded-lg border border-zinc-200 bg-white p-5 text-sm text-zinc-600">
+        Loading products...
+      </div>
+    );
+  }
+
+  return (
+    <Panel title="Products">
+      <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+        <label className="grid gap-1 text-xs font-medium text-zinc-500 md:w-80">
+          Search product or SKU
+          <input
+            className="h-10 rounded-md border border-zinc-300 bg-white px-3 text-sm text-zinc-900 outline-none transition focus:border-zinc-900"
+            placeholder="Search by name or SKU"
+            type="search"
+            value={search}
+            onChange={(event) => onSearchChange(event.target.value)}
+          />
+        </label>
+        <p className="text-sm text-zinc-500">
+          Showing {formatNumber(filteredProducts.length)} of{" "}
+          {formatNumber(products.length)} products
+        </p>
+      </div>
+
+      {visibleProducts.length === 0 ? (
+        <EmptyState label="No products match your search." />
+      ) : (
+        <div className="mt-5 w-full overflow-hidden">
+          <table className="w-full table-fixed text-left text-sm">
+            <colgroup>
+              <col className="w-[7%]" />
+              <col className="w-[31%]" />
+              <col className="w-[35%]" />
+              <col className="w-[8%]" />
+              <col className="w-[7%]" />
+              <col className="w-[7%]" />
+              <col className="w-[5%]" />
+            </colgroup>
+            <thead>
+              <tr className="border-b border-zinc-200 text-xs uppercase tracking-wide text-zinc-500">
+                <th className="px-2 py-3 font-semibold">Image</th>
+                <th className="px-2 py-3 font-semibold">Product</th>
+                <th className="px-2 py-3 font-semibold">SKU aliases</th>
+                <th className="px-2 py-3 text-right font-semibold">Weight</th>
+                <th className="px-2 py-3 text-right font-semibold">Lines</th>
+                <th className="px-2 py-3 text-right font-semibold">Buys</th>
+                <th className="px-2 py-3 text-right font-semibold">View</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-100">
+              {visibleProducts.map((product) => (
+                <tr
+                  className="cursor-pointer align-top hover:bg-zinc-50"
+                  key={productRowKey(product) as string}
+                  onClick={() => onSelectProduct(product)}
+                >
+                  <td className="px-2 py-3">
+                    <ProductImage
+                      alt={`${product.name || "Product"} image`}
+                      size="small"
+                      src={product.imageUrl}
+                    />
+                  </td>
+                  <td className="min-w-0 px-2 py-3">
+                    <p className="line-clamp-2 font-medium text-zinc-900">
+                      {product.name || "-"}
+                    </p>
+                    <p className="mt-1 line-clamp-1 text-xs text-zinc-500">
+                      {product.description || "No description"}
+                    </p>
+                  </td>
+                  <td className="min-w-0 px-2 py-3">
+                    <SkuChips skus={product.skuAliases ?? []} />
+                  </td>
+                  <td className="px-2 py-3 text-right tabular-nums text-zinc-700">
+                    {formatCellValue(product.weight)}
+                  </td>
+                  <td className="px-2 py-3 text-right tabular-nums text-zinc-700">
+                    {formatNumber(product.orderLines ?? 0)}
+                  </td>
+                  <td className="px-2 py-3 text-right tabular-nums text-zinc-700">
+                    {formatNumber(product.stockPurchases ?? 0)}
+                  </td>
+                  <td className="px-2 py-3 text-right">
+                    <button
+                      className="rounded-md border border-zinc-300 px-2 py-1.5 text-xs font-medium transition hover:bg-white"
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onSelectProduct(product);
+                      }}
+                    >
+                      View
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="mt-4 flex flex-col gap-3 border-t border-zinc-100 pt-4 sm:flex-row sm:items-center sm:justify-between">
+        <p className="text-sm text-zinc-500">
+          Page {formatNumber(currentPage)} of {formatNumber(pageCount)}
+        </p>
+        <div className="flex gap-2">
+          <button
+            className="h-9 rounded-md border border-zinc-300 px-3 text-sm font-medium transition hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={currentPage <= 1}
+            type="button"
+            onClick={() => onPageChange(currentPage - 1)}
+          >
+            Previous
+          </button>
+          <button
+            className="h-9 rounded-md border border-zinc-300 px-3 text-sm font-medium transition hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={currentPage >= pageCount}
+            type="button"
+            onClick={() => onPageChange(currentPage + 1)}
+          >
+            Next
+          </button>
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+function SkuChips({ skus }: { skus: string[] }) {
+  const visibleSkus = uniqueNonEmptyStrings(skus);
+
+  if (visibleSkus.length === 0) {
+    return <span className="text-zinc-400">-</span>;
+  }
+
+  const visible = visibleSkus.slice(0, 2);
+  const remaining = visibleSkus.length - visible.length;
+
+  return (
+    <div className="flex min-w-0 flex-wrap gap-1.5">
+      {visible.map((sku) => (
+        <span
+          className="max-w-full truncate rounded-full bg-zinc-100 px-2 py-1 text-xs font-medium text-zinc-700"
+          key={sku}
+          title={sku}
+        >
+          {sku}
+        </span>
+      ))}
+      {remaining > 0 ? (
+        <span className="rounded-full bg-zinc-950 px-2 py-1 text-xs font-medium text-white">
+          +{remaining} more
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+type OrderLineRow = Record<string, SectionData["rows"][number][string]> & {
+  orderNumber?: string;
+  store?: string;
+  invoice?: string;
+  status?: string;
+  date?: string;
+  trackingNumbers?: string;
+  sku?: string;
+  quantity?: number;
+  productCost?: number;
+  shippingCost?: number;
+  handlingCost?: number;
+  totalCost?: number;
+  lineType?: string;
+  sourceSheet?: string;
+  sourceRow?: number;
+  product?: ProductRow | null;
+};
+
+function normalizeOrderRows(rows: SectionData["rows"]) {
+  return uniqueByKey(
+    (rows as OrderLineRow[]).map((row) => ({
+      ...row,
+      orderNumber: cleanKeyPart(row.orderNumber),
+      store: cleanKeyPart(row.store),
+      invoice: cleanKeyPart(row.invoice),
+      status: cleanKeyPart(row.status),
+      date: cleanKeyPart(row.date),
+      trackingNumbers: cleanKeyPart(row.trackingNumbers),
+      sku: cleanKeyPart(row.sku),
+    })),
+    orderLineRowKey,
+  );
+}
+
+function OrderFiltersPanel({
+  filters,
+  invoices,
+  skus,
+  stores,
+  onChange,
+}: {
+  filters: Filters;
+  invoices: string[];
+  skus: string[];
+  stores: string[];
+  onChange: (filters: Filters) => void;
+}) {
+  return (
+    <section className="min-w-0 rounded-lg border border-zinc-200 bg-white/95 px-4 py-3 shadow-sm backdrop-blur [&_input]:h-9 [&_select]:h-9">
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-sm font-semibold">Order filters</h2>
+        <button
+          className="h-8 rounded-md border border-zinc-300 px-3 text-xs font-medium transition hover:bg-zinc-50"
+          type="button"
+          onClick={() =>
+            onChange({
+              ...filters,
+              store: "",
+              dateFrom: "",
+              dateTo: "",
+              orderNumber: "",
+              invoice: "",
+              sku: "",
+              trackingNumber: "",
+            })
+          }
+        >
+          Clear
+        </button>
+      </div>
+
+      <div className="mt-2 grid gap-2 md:grid-cols-4 2xl:grid-cols-7">
+        <FilterSelect
+          label="Store"
+          placeholder="All stores"
+          options={stores}
+          value={filters.store}
+          onChange={(value) => onChange({ ...filters, store: value })}
+        />
+        <FilterInput
+          label="Date from"
+          type="date"
+          value={filters.dateFrom}
+          onChange={(value) => onChange({ ...filters, dateFrom: value })}
+        />
+        <FilterInput
+          label="Date to"
+          type="date"
+          value={filters.dateTo}
+          onChange={(value) => onChange({ ...filters, dateTo: value })}
+        />
+        <FilterInput
+          label="Order number"
+          placeholder="Search order number"
+          value={filters.orderNumber}
+          onChange={(value) => onChange({ ...filters, orderNumber: value })}
+        />
+        <FilterSelect
+          label="Invoice"
+          placeholder="All invoices"
+          options={invoices}
+          value={filters.invoice}
+          onChange={(value) => onChange({ ...filters, invoice: value })}
+        />
+        <FilterSelect
+          label="SKU / product"
+          placeholder="All SKUs"
+          options={skus}
+          value={filters.sku}
+          onChange={(value) => onChange({ ...filters, sku: value })}
+        />
+        <FilterInput
+          label="Tracking number"
+          placeholder="Search tracking"
+          value={filters.trackingNumber}
+          onChange={(value) => onChange({ ...filters, trackingNumber: value })}
+        />
+      </div>
+    </section>
+  );
+}
+
+function OrdersSection({
+  data,
+  isLoading,
+  onSelectProduct,
+}: {
+  data: SectionData | null;
+  isLoading: boolean;
+  onSelectProduct: (product: ProductRow) => void;
+}) {
+  const [selectedOrder, setSelectedOrder] = useState<OrderLineRow | null>(null);
+  const [selectedProductSummary, setSelectedProductSummary] =
+    useState<ProductRow | null>(null);
+  const rows = useMemo(
+    () => normalizeOrderRows(data?.rows ?? []),
+    [data],
+  );
+
+  if (isLoading) {
+    return (
+      <div className="rounded-lg border border-zinc-200 bg-white p-5 text-sm text-zinc-600">
+        Loading orders...
+      </div>
+    );
+  }
+
+  if (rows.length === 0) {
+    return (
+      <Panel title="Orders">
+        <EmptyState label="No orders found." />
+      </Panel>
+    );
+  }
+
+  return (
+    <>
+      <Panel title={`Orders (${formatNumber(rows.length)})`}>
+        <div className="overflow-hidden">
+          <table className="w-full table-fixed text-left text-sm">
+            <colgroup>
+              <col className="w-[16%]" />
+              <col className="w-[18%]" />
+              <col className="hidden w-[13%] md:table-column" />
+              <col className="w-[19%]" />
+              <col className="hidden w-[18%] lg:table-column" />
+              <col className="w-[14%]" />
+              <col className="w-[13%]" />
+            </colgroup>
+            <thead>
+              <tr className="border-b border-zinc-200 text-xs uppercase tracking-wide text-zinc-500">
+                <th className="px-2 py-3 font-semibold">Order</th>
+                <th className="px-2 py-3 font-semibold">Store</th>
+                <th className="hidden px-2 py-3 font-semibold md:table-cell">
+                  Date
+                </th>
+                <th className="px-2 py-3 font-semibold">Tracking</th>
+                <th className="hidden px-2 py-3 font-semibold lg:table-cell">
+                  Product
+                </th>
+                <th className="px-2 py-3 text-right font-semibold">Total</th>
+                <th className="px-2 py-3 text-right font-semibold">View</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-100">
+              {rows.map((row) => (
+                <tr className="align-top hover:bg-zinc-50" key={orderLineRowKey(row) as string}>
+                  <td className="min-w-0 px-2 py-3">
+                    <p className="truncate font-medium text-zinc-900">
+                      {row.orderNumber || "-"}
+                    </p>
+                    <p className="mt-1 truncate text-xs text-zinc-500 md:hidden">
+                      {row.date || "-"}
+                    </p>
+                  </td>
+                  <td className="min-w-0 px-2 py-3">
+                    <p className="truncate text-zinc-700">{row.store || "-"}</p>
+                  </td>
+                  <td className="hidden whitespace-nowrap px-2 py-3 text-zinc-700 md:table-cell">
+                    {row.date || "-"}
+                  </td>
+                  <td className="min-w-0 px-2 py-3">
+                    <p className="truncate text-zinc-700" title={row.trackingNumbers}>
+                      {row.trackingNumbers || "-"}
+                    </p>
+                  </td>
+                  <td className="hidden min-w-0 px-2 py-3 lg:table-cell">
+                    <p className="truncate text-zinc-700" title={row.sku}>
+                      {row.sku || "-"}
+                    </p>
+                  </td>
+                  <td className="whitespace-nowrap px-2 py-3 text-right tabular-nums text-zinc-700">
+                    {formatCurrency(Number(row.totalCost ?? 0))}
+                  </td>
+                  <td className="px-2 py-3 text-right">
+                    <button
+                      className="h-8 rounded-md border border-zinc-300 px-2 text-xs font-medium transition hover:bg-white"
+                      type="button"
+                      onClick={() => setSelectedOrder(row)}
+                    >
+                      Details
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Panel>
+
+      {selectedOrder ? (
+        <OrderDetailsModal
+          order={selectedOrder}
+          onClose={() => setSelectedOrder(null)}
+          onSelectProduct={(product) => {
+            setSelectedOrder(null);
+            setSelectedProductSummary(product);
+          }}
+        />
+      ) : null}
+      {selectedProductSummary ? (
+        <FastProductSummaryModal
+          product={selectedProductSummary}
+          onClose={() => setSelectedProductSummary(null)}
+          onOpenFullDetails={() => {
+            setSelectedProductSummary(null);
+            onSelectProduct(selectedProductSummary);
+          }}
+        />
+      ) : null}
+    </>
+  );
+}
+
+function orderLineRowKey(row: OrderLineRow) {
+  return [
+    cleanKeyPart(row.orderNumber),
+    cleanKeyPart(row.invoice),
+    cleanKeyPart(row.store),
+    cleanKeyPart(row.sku),
+    cleanKeyPart(row.sourceSheet),
+    row.sourceRow ?? "",
+  ]
+    .join("|")
+    .trim();
+}
+
+function OrderDetailsModal({
+  order,
+  onClose,
+  onSelectProduct,
+}: {
+  order: OrderLineRow;
+  onClose: () => void;
+  onSelectProduct: (product: ProductRow) => void;
+}) {
+  const product = isProductRow(order.product) ? order.product : null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/40 p-4">
+      <div className="max-h-[90vh] w-full max-w-4xl overflow-auto rounded-lg bg-white p-5 shadow-xl">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold">
+              Order {order.orderNumber || "-"}
+            </h2>
+            <p className="mt-1 text-sm text-zinc-500">
+              {order.store || "-"} · {order.date || "-"}
+            </p>
+          </div>
+          <button
+            className="h-9 rounded-md border border-zinc-300 px-3 text-sm"
+            type="button"
+            onClick={onClose}
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <DetailItem label="Invoice" value={order.invoice} />
+          <DetailItem label="Status" value={order.status} />
+          <DetailItem label="Tracking" value={order.trackingNumbers} />
+          <DetailItem label="Line type" value={order.lineType} />
+        </div>
+
+        <section className="mt-5 rounded-md border border-zinc-200 p-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              <h3 className="text-sm font-semibold">Product line</h3>
+              <p className="mt-2 truncate text-sm text-zinc-700">
+                {order.sku || "-"}
+              </p>
+            </div>
+            {product ? (
+              <button
+                className="h-9 rounded-md border border-zinc-300 px-3 text-sm font-medium transition hover:bg-zinc-50"
+                type="button"
+                onClick={() => onSelectProduct(product)}
+              >
+                Product info
+              </button>
+            ) : null}
+          </div>
+
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <DetailItem label="Quantity" value={order.quantity} />
+            <DetailItem label="Product cost" value={formatCurrency(Number(order.productCost ?? 0))} />
+            <DetailItem label="Shipping cost" value={formatCurrency(Number(order.shippingCost ?? 0))} />
+            <DetailItem label="Handling cost" value={formatCurrency(Number(order.handlingCost ?? 0))} />
+            <DetailItem label="Total cost" value={formatCurrency(Number(order.totalCost ?? 0))} />
+          </div>
+        </section>
+
+        <section className="mt-5 rounded-md border border-zinc-200 p-4">
+          <h3 className="text-sm font-semibold">Import source</h3>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <DetailItem label="Source sheet" value={order.sourceSheet} />
+            <DetailItem label="Source row" value={order.sourceRow} />
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function DetailItem({
+  label,
+  value,
+}: {
+  label: string;
+  value: string | number | null | undefined;
+}) {
+  return (
+    <div className="min-w-0 rounded-md bg-zinc-50 p-3">
+      <p className="text-xs font-medium text-zinc-500">{label}</p>
+      <p className="mt-1 truncate text-sm font-medium text-zinc-900" title={String(value ?? "")}>
+        {value === null || value === undefined || value === "" ? "-" : value}
+      </p>
+    </div>
+  );
+}
+
+function FastProductSummaryModal({
+  product,
+  onClose,
+  onOpenFullDetails,
+}: {
+  product: ProductRow;
+  onClose: () => void;
+  onOpenFullDetails: () => void;
+}) {
+  const skus = uniqueNonEmptyStrings(product.skuAliases);
+  const stores = uniqueNonEmptyStrings(product.stores);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/40 p-4">
+      <div className="max-h-[90vh] w-full max-w-2xl overflow-auto rounded-lg bg-white p-5 shadow-xl">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h2 className="truncate text-lg font-semibold">{product.name}</h2>
+            <p className="mt-1 line-clamp-2 text-sm text-zinc-500">
+              {product.description || "No description"}
+            </p>
+          </div>
+          <button
+            className="h-9 rounded-md border border-zinc-300 px-3 text-sm"
+            type="button"
+            onClick={onClose}
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="mt-5 grid gap-4 sm:grid-cols-[7rem_1fr]">
+          <ProductImage
+            alt={`${product.name || "Product"} image`}
+            size="large"
+            src={product.imageUrl}
+          />
+          <div className="grid gap-3 sm:grid-cols-2">
+            <DetailItem label="Weight" value={product.weight} />
+            <DetailItem label="Order lines" value={product.orderLines ?? 0} />
+            <DetailItem label="Stock purchases" value={product.stockPurchases ?? 0} />
+            <DetailItem label="Inventory moves" value={product.inventoryMovements ?? 0} />
+          </div>
+        </div>
+
+        <section className="mt-5 rounded-md border border-zinc-200 p-4">
+          <h3 className="text-sm font-semibold">SKUs</h3>
+          <div className="mt-3">
+            <SkuChips skus={skus} />
+          </div>
+        </section>
+
+        <section className="mt-5 rounded-md border border-zinc-200 p-4">
+          <h3 className="text-sm font-semibold">Stores</h3>
+          <p className="mt-2 text-sm text-zinc-700">
+            {stores.length > 0 ? stores.join(", ") : "-"}
+          </p>
+        </section>
+
+        <div className="mt-5 flex justify-end">
+          <button
+            className="h-9 rounded-md bg-zinc-950 px-3 text-sm font-medium text-white transition hover:bg-zinc-800"
+            type="button"
+            onClick={onOpenFullDetails}
+          >
+            Full details
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProductDetailsModal({
+  product,
+  onClose,
+}: {
+  product: ProductRow;
+  onClose: () => void;
+}) {
+  const skus = uniqueNonEmptyStrings(product.skuAliases);
+  const stores = uniqueNonEmptyStrings(product.stores);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/40 p-4">
+      <div className="max-h-[90vh] w-full max-w-6xl overflow-auto rounded-lg bg-white p-5 shadow-xl">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold">{product.name}</h2>
+            <p className="mt-1 text-sm text-zinc-500">
+              {product.description || "No description"}
+            </p>
+          </div>
+          <button
+            className="h-9 rounded-md border border-zinc-300 px-3 text-sm"
+            type="button"
+            onClick={onClose}
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="sm:col-span-2 lg:col-span-4">
+            <ProductImage
+              alt={`${product.name || "Product"} image`}
+              size="large"
+              src={product.imageUrl}
+            />
+          </div>
+          <Metric label="Weight" value={formatCellValue(product.weight)} />
+          <Metric
+            label="Order lines"
+            value={formatNumber(product.orderLines ?? 0)}
+          />
+          <Metric
+            label="Stock purchases"
+            value={formatNumber(product.stockPurchases ?? 0)}
+          />
+          <Metric
+            label="Current inventory"
+            value={formatNumber(product.currentInventory ?? 0)}
+          />
+        </div>
+
+        <div className="mt-5 grid gap-5 lg:grid-cols-2">
+          <PreviewList title="All SKU aliases" items={skus} />
+          <PreviewList title="Linked stores" items={stores} />
+        </div>
+
+        <QuotationDetails quotation={product.quotation ?? null} />
+      </div>
+    </div>
+  );
+}
+
+function QuotationDetails({
+  quotation,
+}: {
+  quotation: ProductQuotation | null;
+}) {
+  if (!quotation) {
+    return (
+      <section className="mt-5">
+        <h3 className="text-sm font-semibold">Quotation data</h3>
+        <p className="mt-3 rounded-md border border-dashed border-zinc-200 p-3 text-sm text-zinc-500">
+          None
+        </p>
+      </section>
+    );
+  }
+
+  const rows = uniqueByKey(getQuotationOfferRows(quotation), quotationRowKey);
+
+  return (
+    <section className="mt-5">
+      <h3 className="text-sm font-semibold">Quotation table</h3>
+      <div className="mt-3 overflow-x-auto rounded-md border border-zinc-200">
+        <table className="w-full min-w-[1680px] text-left text-xs">
+          <thead className="bg-zinc-50 text-[11px] uppercase tracking-wide text-zinc-500">
+            <tr>
+              <th className="px-3 py-2 font-semibold">Quantity / MOQ</th>
+              <th className="px-3 py-2 text-right font-semibold">Unit price (USD)</th>
+              <th className="px-3 py-2 text-right font-semibold">Weight (kg)</th>
+              <th className="px-3 py-2 text-right font-semibold">Freight FR</th>
+              <th className="px-3 py-2 text-right font-semibold">Freight DE</th>
+              <th className="px-3 py-2 text-right font-semibold">Freight GB</th>
+              <th className="px-3 py-2 text-right font-semibold">Freight USA</th>
+              <th className="px-3 py-2 text-right font-semibold">Service fee</th>
+              <th className="px-3 py-2 text-right font-semibold">Total cost FR</th>
+              <th className="px-3 py-2 text-right font-semibold">Total cost DE</th>
+              <th className="px-3 py-2 text-right font-semibold">Total cost GB</th>
+              <th className="px-3 py-2 text-right font-semibold">Total cost USA</th>
+              <th className="px-3 py-2 font-semibold">Delivery time</th>
+              <th className="px-3 py-2 text-right font-semibold">Selling price</th>
+              <th className="px-3 py-2 font-semibold">Notes / stock status</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-zinc-100">
+            {rows.length > 0 ? (
+              rows.map((row) => (
+                <tr
+                  className="align-top hover:bg-zinc-50"
+                  key={quotationRowKey(row) as string}
+                >
+                  <td className="px-3 py-2">{quotationValue(row.quantityLabel)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{quotationValue(row.unitPrice)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{quotationValue(row.weight)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{quotationValue(row.freightFR)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{quotationValue(row.freightDE)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{quotationValue(row.freightGB)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{quotationValue(row.freightUSA)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{quotationValue(row.serviceFee)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{quotationValue(row.totalCostFR)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{quotationValue(row.totalCostDE)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{quotationValue(row.totalCostGB)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{quotationValue(row.totalCostUSA)}</td>
+                  <td className="px-3 py-2">{quotationValue(row.deliveryTime)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{quotationValue(row.sellingPrice)}</td>
+                  <td className="min-w-[16rem] px-3 py-2">{quotationValue(row.notes)}</td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td className="px-3 py-4 text-zinc-500" colSpan={15}>
+                  No quotation rows stored.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function getQuotationOfferRows(quotation: ProductQuotation): QuotationOfferRow[] {
+  if (quotation.quotationRows?.length) return quotation.quotationRows;
+
+  const fallbackNotes = [
+    ...(quotation.quantityConditions ?? []),
+    ...(quotation.stockNotes ?? []),
+    ...(quotation.notes ?? []),
+    quotation.retired ? "Marked retired / will be removed" : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
+
+  if (quotation.priceTiers?.length) {
+    return quotation.priceTiers.map((tier) => ({
+      quantity: tier.quantity,
+      quantityLabel: tier.quantity,
+      unitPrice: tier.unitPrice,
+      totalCostFR: tier.landedCost ?? quotation.landedCost,
+      sellingPrice: tier.sellingPrice ?? quotation.sellingPrice,
+      notes: fallbackNotes,
+    }));
+  }
+
+  return [
+    {
+      quantity: quotation.moq ?? quotation.quantity,
+      quantityLabel: quotation.moq ?? quotation.quantity,
+      unitPrice: quotation.unitPrice,
+      weight: quotation.weight,
+      freightFR: amountForCountry(quotation.freightByCountry, "FR"),
+      freightDE: amountForCountry(quotation.freightByCountry, "DE"),
+      freightGB: amountForCountry(quotation.freightByCountry, "GB"),
+      freightUSA: amountForCountry(quotation.freightByCountry, "USA"),
+      serviceFee: quotation.serviceFee,
+      totalCostFR:
+        quotation.landedCost ?? amountForCountry(quotation.landedCostByCountry, "FR"),
+      totalCostDE: amountForCountry(quotation.landedCostByCountry, "DE"),
+      totalCostGB: amountForCountry(quotation.landedCostByCountry, "GB"),
+      totalCostUSA: amountForCountry(quotation.landedCostByCountry, "USA"),
+      deliveryTime: quotation.deliveryTime,
+      sellingPrice: quotation.sellingPrice,
+      notes: fallbackNotes,
+    },
+  ].filter((row) => Object.values(row).some((value) => value !== undefined && value !== ""));
+}
+
+function amountForCountry(
+  values: Array<{ country: string; amount: number }> | undefined,
+  country: string,
+) {
+  return values?.find((item) => item.country === country)?.amount;
+}
+
+function quotationValue(value: string | number | undefined | null) {
+  if (value === null || value === undefined || value === "") return "—";
+  return typeof value === "number" ? formatNumber(value) : String(value);
+}
+
+function isProductRow(value: unknown): value is ProductRow {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    "name" in value &&
+    typeof (value as { name?: unknown }).name === "string"
+  );
+}
+
+function SectionTable({
+  data,
+  isLoading,
+  onSelectProduct,
+  title,
+}: {
+  data: SectionData | null;
+  isLoading: boolean;
+  onSelectProduct?: (product: ProductRow) => void;
+  title: string;
+}) {
+  if (isLoading) {
+    return (
+      <div className="rounded-lg border border-zinc-200 bg-white p-5 text-sm text-zinc-600">
+        Loading {title.toLowerCase()}...
+      </div>
+    );
+  }
+
+  if (!data || data.rows.length === 0) {
+    return (
+      <Panel title={title}>
+        <EmptyState label={`No ${title.toLowerCase()} found.`} />
+      </Panel>
+    );
+  }
+
+  const visibleRows = uniqueByKey(data.rows, recordRowKey);
+
+  return (
+    <Panel title={`${data.title} (${formatNumber(visibleRows.length)})`}>
+      <div className="overflow-x-auto">
+        <table className="min-w-full text-left text-sm">
+          <thead>
+            <tr className="border-b border-zinc-200 text-xs uppercase tracking-wide text-zinc-500">
+              {data.columns.map((column) => (
+                <th className="whitespace-nowrap px-3 py-3 font-semibold" key={column.key}>
+                  {column.label}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-zinc-100">
+            {visibleRows.map((row) => (
+              <tr className="hover:bg-zinc-50" key={recordRowKey(row) as string}>
+                {data.columns.map((column) => (
+                  <td
+                    className="max-w-xs whitespace-nowrap px-3 py-3 text-zinc-700"
+                    key={column.key}
+                    title={String(row[column.key] ?? "")}
+                  >
+                    {column.key === "sku" && isProductRow(row.product) ? (
+                      <button
+                        className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-900 transition hover:bg-zinc-50"
+                        type="button"
+                        onClick={() => {
+                          if (isProductRow(row.product)) {
+                            onSelectProduct?.(row.product);
+                          }
+                        }}
+                      >
+                        {formatCellValue(row[column.key])}
+                      </button>
+                    ) : (
+                      formatCellValue(row[column.key])
+                    )}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Panel>
+  );
+}
+
+function LinePanel({ data, empty }: { data: ChartPoint[]; empty: string }) {
+  if (data.length === 0) return <EmptyState label={empty} />;
+
+  return (
+    <div className="h-64">
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={data}>
+          <XAxis dataKey="label" tickLine={false} />
+          <YAxis tickLine={false} />
+          <Tooltip />
+          <Line dataKey="total" stroke="#18181b" strokeWidth={2} type="monotone" />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function BarPanel({ data, empty }: { data: ChartPoint[]; empty: string }) {
+  if (data.length === 0) return <EmptyState label={empty} />;
+
+  return (
+    <div className="h-64">
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data}>
+          <XAxis dataKey="label" tickLine={false} />
+          <YAxis tickLine={false} />
+          <Tooltip />
+          <Bar dataKey="total" fill="#18181b" radius={[4, 4, 0, 0]} />
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function PiePanel({ data, empty }: { data: ChartPoint[]; empty: string }) {
+  if (data.length === 0) return <EmptyState label={empty} />;
+
+  return (
+    <div className="h-64">
+      <ResponsiveContainer width="100%" height="100%">
+        <PieChart>
+          <Pie data={data} dataKey="total" innerRadius={55} nameKey="label" outerRadius={85}>
+            {data.map((entry, index) => (
+              <Cell fill={chartColors[index % chartColors.length]} key={entry.label} />
+            ))}
+          </Pie>
+          <Tooltip />
+        </PieChart>
+      </ResponsiveContainer>
+    </div>
   );
 }
