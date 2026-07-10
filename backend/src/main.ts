@@ -1,10 +1,12 @@
 import { NestFactory } from '@nestjs/core';
+import compression from 'compression';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const allowedOrigins = getAllowedOrigins();
 
+  app.use(compression());
   app.enableCors({
     origin: createCorsOriginHandler(allowedOrigins),
     credentials: true,

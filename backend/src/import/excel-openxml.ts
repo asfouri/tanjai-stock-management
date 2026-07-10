@@ -13,6 +13,14 @@ export type WorkbookSheet = {
   comments: Record<string, string>;
   images: WorkbookImage[];
   imageWarnings: WorkbookImageWarning[];
+  merges: WorkbookMergedRange[];
+};
+
+export type WorkbookMergedRange = {
+  startRow: number;
+  startColumn: number;
+  endRow: number;
+  endColumn: number;
 };
 
 export type ParsedWorkbook = {
@@ -73,6 +81,7 @@ export function parseXlsxWorkbook(buffer: Buffer): ParsedWorkbook {
       comments,
       images,
       imageWarnings,
+      merges: parseMergedRanges(sheetXml),
     };
   });
 
@@ -243,6 +252,32 @@ export function parseRows(
   }
 
   return rows;
+}
+
+function parseMergedRanges(xml: string): WorkbookMergedRange[] {
+  const merges: WorkbookMergedRange[] = [];
+  const mergeRegex = /<mergeCell\b[^>]*\bref="([A-Za-z]+\d+):([A-Za-z]+\d+)"/g;
+
+  for (const match of xml.matchAll(mergeRegex)) {
+    const start = cellRefToPosition(match[1]);
+    const end = cellRefToPosition(match[2]);
+    if (!start || !end) continue;
+
+    merges.push({
+      startRow: Math.min(start.row, end.row),
+      startColumn: Math.min(start.column, end.column),
+      endRow: Math.max(start.row, end.row),
+      endColumn: Math.max(start.column, end.column),
+    });
+  }
+
+  return merges;
+}
+
+function cellRefToPosition(ref: string) {
+  const match = ref.match(/^([A-Za-z]+)(\d+)$/);
+  if (!match) return null;
+  return { row: Number(match[2]), column: columnToNumber(ref) };
 }
 
 function parseCellValue(

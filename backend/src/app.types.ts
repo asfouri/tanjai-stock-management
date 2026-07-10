@@ -20,10 +20,16 @@ export type DashboardFilters = {
   store?: string;
   dateFrom?: string;
   dateTo?: string;
+  invoiceDateFrom?: string;
+  invoiceDateTo?: string;
   sku?: string;
   invoice?: string;
   orderNumber?: string;
   trackingNumber?: string;
+  country?: string;
+  orderSearch?: string;
+  orderSort?: 'asc' | 'desc' | '';
+  orderPage?: string;
 };
 
 export type DashboardDebugCounts = {
@@ -71,6 +77,7 @@ export type DashboardSummary = {
     invoices: string[];
     orderNumbers: string[];
     trackingNumbers: string[];
+    countries: string[];
     dates: string[];
   };
   debugCounts?: DashboardDebugCounts;
@@ -80,6 +87,13 @@ export type DashboardSection = {
   title: string;
   columns: Array<{ key: string; label: string }>;
   rows: Array<
-    Record<string, string | number | string[] | Record<string, unknown> | null>
+    Record<
+      string,
+      string | number | boolean | string[] | Record<string, unknown> | null
+    >
   >;
+  totalRows?: number;
+  page?: number;
+  pageSize?: number;
+  meta?: Record<string, string | number | boolean | null>;
 };

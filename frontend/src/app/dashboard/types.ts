@@ -22,6 +22,7 @@ export type FilterOptions = {
   invoices: string[];
   orderNumbers: string[];
   trackingNumbers: string[];
+  countries: string[];
   dates: string[];
 };
 
@@ -108,10 +109,15 @@ export type Filters = {
   store: string;
   dateFrom: string;
   dateTo: string;
+  invoiceDateFrom: string;
+  invoiceDateTo: string;
   sku: string;
   invoice: string;
   orderNumber: string;
   trackingNumber: string;
+  country: string;
+  orderSearch: string;
+  orderSort: "asc" | "desc" | "";
 };
 
 export type SectionId =
@@ -120,6 +126,7 @@ export type SectionId =
   | "products"
   | "orders"
   | "inventory"
+  | "product-matching"
   | "stores"
   | "invoices"
   | "payments";
@@ -132,15 +139,21 @@ export type SectionData = {
       string,
       | string
       | number
+      | boolean
       | string[]
       | ProductQuotation
       | ProductRow
       | null
     >
   >;
+  totalRows?: number;
+  page?: number;
+  pageSize?: number;
+  meta?: Record<string, string | number | boolean | null>;
 };
 
 export type ProductQuotation = {
+  productGroup?: string;
   unitPrice?: number;
   weight?: number;
   moq?: string;
@@ -186,6 +199,15 @@ export type QuotationOfferRow = {
   notes?: string;
 };
 
+export type ProductMovement = {
+  date?: string;
+  type?: string;
+  movementType?: string;
+  quantity?: number;
+  reference?: string;
+  comment?: string;
+};
+
 export type ProductRow = {
   id?: string;
   name: string;
@@ -199,6 +221,7 @@ export type ProductRow = {
   stockPurchases: number;
   inventoryMovements?: number;
   currentInventory?: number;
+  movements?: ProductMovement[];
   quotation?: ProductQuotation | null;
 };
 

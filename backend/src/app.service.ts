@@ -1,4 +1,5 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import {
   ChartPoint,
   DashboardDebugCounts,
@@ -27,8 +28,8 @@ export class AppService {
         return this.getProductsSection();
       case 'orders':
         return this.getOrdersSection(normalizedFilters);
-      case 'inventory':
-        return this.getInventorySection();
+      case 'product-matching':
+        return this.getProductMatchingSection();
       case 'stores':
         return this.getStoresSection();
       case 'invoices':
@@ -54,14 +55,16 @@ export class AppService {
       const debugCounts = await this.getDashboardDebugCounts();
       const dashboardRowLimit = 25000;
       const dateFilter = this.dateFilter(filters.dateFrom, filters.dateTo);
-      const brands = await this.prisma.brand.findMany({
-        select: { id: true, name: true },
-        orderBy: { name: 'asc' },
-      });
-      const stores = await this.prisma.store.findMany({
-        select: { id: true, name: true, normalizedName: true, brandId: true },
-        orderBy: { name: 'asc' },
-      });
+      const [brands, stores] = await Promise.all([
+        this.prisma.brand.findMany({
+          select: { id: true, name: true },
+          orderBy: { name: 'asc' },
+        }),
+        this.prisma.store.findMany({
+          select: { id: true, name: true, normalizedName: true, brandId: true },
+          orderBy: { name: 'asc' },
+        }),
+      ]);
       const brandIds = filters.brand
         ? new Set(
             brands
@@ -107,6 +110,14 @@ export class AppService {
               },
             }
           : {}),
+        ...(filters.country
+          ? {
+              country: {
+                contains: filters.country,
+                mode: 'insensitive' as const,
+              },
+            }
+          : {}),
       };
 
       const orderIdSets: string[][] = [];
@@ -133,6 +144,9 @@ export class AppService {
         });
         orderIdSets.push(matchingShipments.map((shipment) => shipment.orderId));
       }
+      if (filters.orderSearch) {
+        orderIdSets.push(await this.findOrderIdsForSearch(filters.orderSearch));
+      }
 
       const filteredOrderIds = this.intersectIdSets(orderIdSets);
       const orderWhere: Record<string, unknown> = {
@@ -152,65 +166,121 @@ export class AppService {
           : {}),
       };
 
-      const totalOrders = await this.prisma.order.count({ where: orderWhere });
-      const totalInvoices = await this.prisma.fulfillmentInvoice.count({
-        where: invoiceWhere,
-      });
-      const pendingOrders = await this.prisma.order.count({
-        where: { ...orderWhere, status: 'PENDING_TRACKING' },
-      });
+      const movementWhereEarly: Record<string, unknown> = {
+        ...(restrictStores ? { storeId: { in: allowedStoreIds } } : {}),
+        ...(dateFilter ? { movementDate: dateFilter } : {}),
+      };
+      const walletWhereEarly: Record<string, unknown> = {
+        ...(restrictStores ? { storeId: { in: allowedStoreIds } } : {}),
+        ...(dateFilter ? { transactionDate: dateFilter } : {}),
+      };
 
-      const orders = await this.prisma.order.findMany({
-        where: orderWhere,
-        select: {
-          id: true,
-          externalOrderNumber: true,
-          orderDate: true,
-          createdAt: true,
-          storeId: true,
-          status: true,
-        },
-        orderBy: { createdAt: 'desc' },
-        take: dashboardRowLimit,
-      });
-      const invoices = await this.prisma.fulfillmentInvoice.findMany({
-        where: invoiceWhere,
-        select: {
-          invoiceReference: true,
-          invoiceDate: true,
-          total: true,
-          refunds: true,
-          adjustments: true,
-          otherCost: true,
-          storeId: true,
-        },
-        take: dashboardRowLimit,
-      });
-      const anomalies = await this.prisma.anomaly.findMany({
-        select: { id: true, severity: true, createdAt: true, message: true },
-        orderBy: { createdAt: 'desc' },
-        take: 1000,
-      });
-      const aliases = await this.prisma.productSkuAlias.findMany({
-        select: { sku: true },
-        orderBy: { sku: 'asc' },
-        take: 500,
-      });
+      const [
+        totalOrders,
+        totalInvoices,
+        pendingOrders,
+        orders,
+        invoices,
+        anomalies,
+        aliases,
+        stockMovements,
+        walletTransactionCount,
+        shipmentRecords,
+        totalShipments,
+        costAgg,
+        invoiceAgg,
+        latestWithBalance,
+      ] = await Promise.all([
+        this.prisma.order.count({ where: orderWhere }),
+        this.prisma.fulfillmentInvoice.count({ where: invoiceWhere }),
+        this.prisma.order.count({
+          where: { ...orderWhere, status: 'PENDING_TRACKING' },
+        }),
+        this.prisma.order.findMany({
+          where: orderWhere,
+          select: {
+            id: true,
+            externalOrderNumber: true,
+            orderDate: true,
+            country: true,
+            createdAt: true,
+            storeId: true,
+            status: true,
+          },
+          orderBy: { createdAt: 'desc' },
+          take: dashboardRowLimit,
+        }),
+        this.prisma.fulfillmentInvoice.findMany({
+          where: invoiceWhere,
+          select: {
+            invoiceReference: true,
+            invoiceDate: true,
+            total: true,
+            refunds: true,
+            adjustments: true,
+            otherCost: true,
+            storeId: true,
+          },
+          take: dashboardRowLimit,
+        }),
+        this.prisma.anomaly.findMany({
+          select: { id: true, severity: true, createdAt: true, message: true },
+          orderBy: { createdAt: 'desc' },
+          take: 1000,
+        }),
+        this.prisma.productSkuAlias.findMany({
+          select: { sku: true },
+          orderBy: { sku: 'asc' },
+          take: 500,
+        }),
+        this.prisma.inventoryMovement.findMany({
+          where: movementWhereEarly,
+          select: {
+            quantity: true,
+            movementType: true,
+            product: { select: { name: true } },
+          },
+          take: dashboardRowLimit,
+        }),
+        this.prisma.walletTransaction.count({ where: walletWhereEarly }),
+        this.prisma.shipment.findMany({
+          where: { order: orderWhere },
+          select: { trackingNumber: true },
+          orderBy: { trackingNumber: 'asc' },
+          take: 500,
+        }),
+        this.prisma.shipment.count({ where: { order: orderWhere } }),
+        this.prisma.orderLine.aggregate({
+          where: {
+            order: orderWhere,
+            lineType: 'product',
+            ...(filters.sku
+              ? {
+                  sku: { contains: filters.sku, mode: 'insensitive' as const },
+                }
+              : {}),
+          },
+          _sum: { productCost: true, shippingCost: true, handlingCost: true },
+        }),
+        this.prisma.fulfillmentInvoice.aggregate({
+          where: invoiceWhere,
+          _sum: { total: true, refunds: true, otherCost: true },
+        }),
+        this.prisma.walletTransaction.findFirst({
+          where: {
+            ...walletWhereEarly,
+            runningBalance: { not: null },
+          },
+          orderBy: { transactionDate: 'desc' },
+          select: { runningBalance: true },
+        }),
+      ]);
 
       const orderIds = orders.map((order) => order.id);
       const relatedOrderWhere =
         orderIds.length > 0
           ? { orderId: { in: orderIds } }
           : { orderId: '__none__' };
-      const movementWhere: Record<string, unknown> = {
-        ...(restrictStores ? { storeId: { in: allowedStoreIds } } : {}),
-        ...(dateFilter ? { movementDate: dateFilter } : {}),
-      };
-      const walletWhere: Record<string, unknown> = {
-        ...(restrictStores ? { storeId: { in: allowedStoreIds } } : {}),
-        ...(dateFilter ? { transactionDate: dateFilter } : {}),
-      };
-
       const lines = await this.prisma.orderLine.findMany({
         where: {
           ...relatedOrderWhere,
@@ -229,54 +299,11 @@ export class AppService {
         },
         take: dashboardRowLimit,
       });
-      const stockMovements = await this.prisma.inventoryMovement.findMany({
-        where: movementWhere,
-        select: {
-          quantity: true,
-          movementType: true,
-          product: { select: { name: true } },
-        },
-        take: dashboardRowLimit,
-      });
-      const walletTransactionCount = await this.prisma.walletTransaction.count({
-        where: walletWhere,
-      });
-      const shipmentRecords = await this.prisma.shipment.findMany({
-        where: { order: orderWhere },
-        select: { trackingNumber: true },
-        orderBy: { trackingNumber: 'asc' },
-        take: 500,
-      });
-      const totalShipments = await this.prisma.shipment.count({
-        where: { order: orderWhere },
-      });
-      const costAgg = await this.prisma.orderLine.aggregate({
-        where: {
-          order: orderWhere,
-          lineType: 'product',
-          ...(filters.sku
-            ? { sku: { contains: filters.sku, mode: 'insensitive' as const } }
-            : {}),
-        },
-        _sum: { productCost: true, shippingCost: true, handlingCost: true },
-      });
-      const invoiceAgg = await this.prisma.fulfillmentInvoice.aggregate({
-        where: invoiceWhere,
-        _sum: { total: true, refunds: true, otherCost: true },
-      });
-      const latestWithBalance = await this.prisma.walletTransaction.findFirst({
-        where: {
-          ...walletWhere,
-          runningBalance: { not: null },
-        },
-        orderBy: { transactionDate: 'desc' },
-        select: { runningBalance: true },
-      });
       const currentBalance =
         latestWithBalance?.runningBalance ??
         (await this.prisma.walletTransaction
           .aggregate({
-            where: walletWhere,
+            where: walletWhereEarly,
             _sum: { amount: true },
           })
           .then((result) => this.round(result._sum.amount ?? 0)));
@@ -401,6 +428,7 @@ export class AppService {
           trackingNumbers: this.uniqueOptions(
             shipmentRecords.map((shipment) => shipment.trackingNumber),
           ),
+          countries: this.uniqueOptions(orders.map((order) => order.country)),
           dates: [
             ...new Set(
               [
@@ -423,18 +451,25 @@ export class AppService {
   }
 
   private async getDashboardDebugCounts(): Promise<DashboardDebugCounts> {
-    const orders = await this.safeCount(this.prisma.order);
-    const shipments = await this.safeCount(this.prisma.shipment);
-    const invoices = await this.safeCount(this.prisma.fulfillmentInvoice);
-    const stockPurchases = await this.safeCount(this.prisma.stockPurchase);
-    const inventoryMovements = await this.safeCount(
-      this.prisma.inventoryMovement,
-    );
-    const walletTransactions = await this.safeCount(
-      this.prisma.walletTransaction,
-    );
-    const products = await this.safeCount(this.prisma.product);
-    const importBatches = await this.safeCount(this.prisma.importBatch);
+    const [
+      orders,
+      shipments,
+      invoices,
+      stockPurchases,
+      inventoryMovements,
+      walletTransactions,
+      products,
+      importBatches,
+    ] = await Promise.all([
+      this.safeCount(this.prisma.order),
+      this.safeCount(this.prisma.shipment),
+      this.safeCount(this.prisma.fulfillmentInvoice),
+      this.safeCount(this.prisma.stockPurchase),
+      this.safeCount(this.prisma.inventoryMovement),
+      this.safeCount(this.prisma.walletTransaction),
+      this.safeCount(this.prisma.product),
+      this.safeCount(this.prisma.importBatch),
+    ]);
 
     const debugCounts = {
       orders,
@@ -480,6 +515,85 @@ export class AppService {
     ];
   }
 
+  private async findOrderIdsForSearch(search: string) {
+    const terms = this.orderSearchTerms(search);
+    if (terms.length === 0) return [];
+    const containsAnyTerm = terms.map((value) => ({
+      contains: value,
+      mode: 'insensitive' as const,
+    }));
+
+    const [orders, products, shipments] = await Promise.all([
+      this.prisma.order.findMany({
+        where: {
+          OR: containsAnyTerm.map((filter) => ({
+            externalOrderNumber: filter,
+          })),
+        },
+        select: { id: true },
+        take: 10000,
+      }),
+      this.prisma.product.findMany({
+        where: {
+          OR: [
+            ...containsAnyTerm.map((filter) => ({ name: filter })),
+            ...containsAnyTerm.map((filter) => ({ description: filter })),
+          ],
+        },
+        select: { id: true },
+        take: 1000,
+      }),
+      this.prisma.shipment.findMany({
+        where: {
+          OR: containsAnyTerm.map((filter) => ({
+            trackingNumber: filter,
+          })),
+        },
+        select: { orderId: true },
+        take: 10000,
+      }),
+    ]);
+    const productIds = products.map((product) => product.id);
+    const lineSearch: Record<string, unknown>[] = containsAnyTerm.map(
+      (filter) => ({ sku: filter }),
+    );
+
+    if (productIds.length > 0) {
+      lineSearch.push({ productId: { in: productIds } });
+    }
+
+    const lines = await this.prisma.orderLine.findMany({
+      where: { OR: lineSearch },
+      select: { orderId: true },
+      take: 10000,
+    });
+
+    return [
+      ...new Set([
+        ...orders.map((order) => order.id),
+        ...lines.map((line) => line.orderId),
+        ...shipments.map((shipment) => shipment.orderId),
+      ]),
+    ];
+  }
+
+  private orderSearchTerms(search: string) {
+    const value = search.trim();
+    if (!value) return [];
+
+    return [
+      ...new Set(
+        [
+          value,
+          ...value.split(/[\s,;|]+/),
+        ]
+          .map((term) => term.trim())
+          .filter((term) => term.length >= 2)
+          .slice(0, 50),
+      ),
+    ];
+  }
+
   private async getProductsSection(): Promise<DashboardSection> {
     try {
       return await this.loadProductsSection(true);
@@ -505,8 +619,18 @@ export class AppService {
         orderBy: { sku: 'asc' },
       },
       inventoryMovements: {
-        select: { quantity: true, movementType: true },
-        take: 1000,
+        select: {
+          movementDate: true,
+          movementType: true,
+          quantity: true,
+          reference: true,
+          comment: true,
+        },
+        orderBy: [
+          { movementDate: { sort: 'desc' as const, nulls: 'last' as const } },
+          { sourceRow: 'desc' as const },
+        ],
+        take: 300,
       },
       _count: {
         select: {
@@ -521,11 +645,31 @@ export class AppService {
       select.quotation = true;
     }
 
-    const products = await this.prisma.product.findMany({
-      orderBy: { name: 'asc' },
-      take: 5000,
-      select,
-    });
+    const [products, movementTotals] = await Promise.all([
+      this.prisma.product.findMany({
+        orderBy: { name: 'asc' },
+        take: 5000,
+        select,
+      }),
+      this.prisma.inventoryMovement.groupBy({
+        by: ['productId', 'movementType'],
+        _sum: { quantity: true },
+        where: { productId: { not: null } },
+      }),
+    ]);
+    const inventoryByProduct = new Map<string, number>();
+    for (const total of movementTotals) {
+      if (!total.productId || total.movementType === 'snapshot') continue;
+      const sign =
+        total.movementType === 'consumption' || total.movementType === 'used'
+          ? -1
+          : 1;
+      inventoryByProduct.set(
+        total.productId,
+        (inventoryByProduct.get(total.productId) ?? 0) +
+          (total._sum.quantity ?? 0) * sign,
+      );
+    }
     const catalogProducts = products.filter((product) =>
       this.isCatalogProduct(product, includeQuotation),
     );
@@ -540,12 +684,20 @@ export class AppService {
         { key: 'stockPurchases', label: 'Stock purchases' },
       ],
       rows: catalogProducts.map((product) =>
-        this.productResponseRow(product, includeQuotation),
+        this.productResponseRow(
+          product,
+          includeQuotation,
+          inventoryByProduct.get((product as { id: string }).id) ?? 0,
+        ),
       ),
     };
   }
 
-  private productResponseRow(product: any, includeQuotation: boolean) {
+  private productResponseRow(
+    product: any,
+    includeQuotation: boolean,
+    currentInventory = 0,
+  ) {
     return {
       id: product.id,
       name: product.name,
@@ -568,17 +720,15 @@ export class AppService {
       orderLines: product._count.orderLines,
       stockPurchases: product._count.stockPurchases,
       inventoryMovements: product._count.inventoryMovements,
-      currentInventory: this.round(
-        product.inventoryMovements.reduce((total: number, movement: any) => {
-          if (movement.movementType === 'snapshot') return total;
-          const sign =
-            movement.movementType === 'consumption' ||
-            movement.movementType === 'used'
-              ? -1
-              : 1;
-          return total + movement.quantity * sign;
-        }, 0),
-      ),
+      currentInventory: this.round(currentInventory),
+      movements: (product.inventoryMovements ?? []).map((movement: any) => ({
+        date: this.formatDateValue(movement.movementDate),
+        type: this.formatLabel(movement.movementType),
+        movementType: movement.movementType,
+        quantity: movement.quantity,
+        reference: movement.reference ?? '-',
+        comment: movement.comment ?? '',
+      })),
     };
   }
 
@@ -697,11 +847,6 @@ export class AppService {
       return false;
     }
 
-    const knownCategoryLabels = new Set(['hydromax', 'pant+pands', 'pants']);
-    if (knownCategoryLabels.has(normalizedName)) {
-      return false;
-    }
-
     if (
       normalizedName.includes('stock at warehouse') ||
       normalizedName.includes('factory have prepare stock') ||
@@ -740,7 +885,11 @@ export class AppService {
     filters: DashboardFilters = {},
   ): Promise<DashboardSection> {
     const dateFilter = this.dateFilter(filters.dateFrom, filters.dateTo);
-    const where: Record<string, unknown> = {
+    const invoiceDateFilter = this.dateFilter(
+      filters.invoiceDateFrom,
+      filters.invoiceDateTo,
+    );
+    const where: Prisma.OrderWhereInput = {
       ...(dateFilter ? { orderDate: dateFilter } : {}),
       ...(filters.orderNumber
         ? {
@@ -754,6 +903,14 @@ export class AppService {
         ? {
             invoiceReference: {
               contains: filters.invoice,
+              mode: 'insensitive' as const,
+            },
+          }
+        : {}),
+      ...(filters.country
+        ? {
+            country: {
+              contains: filters.country,
               mode: 'insensitive' as const,
             },
           }
@@ -800,71 +957,137 @@ export class AppService {
       });
       orderIdSets.push(matchingShipments.map((shipment) => shipment.orderId));
     }
+    if (filters.orderSearch) {
+      orderIdSets.push(await this.findOrderIdsForSearch(filters.orderSearch));
+    }
+    if (invoiceDateFilter) {
+      const matchingInvoices = await this.prisma.fulfillmentInvoice.findMany({
+        where: { invoiceDate: invoiceDateFilter },
+        select: { storeId: true, invoiceReference: true },
+        take: 10000,
+      });
+
+      if (matchingInvoices.length === 0) {
+        orderIdSets.push([]);
+      } else {
+        const matchingInvoiceOrders = await this.prisma.order.findMany({
+          where: {
+            OR: matchingInvoices.map((invoice) => ({
+              storeId: invoice.storeId,
+              invoiceReference: invoice.invoiceReference,
+            })),
+          },
+          select: { id: true },
+          take: 10000,
+        });
+        orderIdSets.push(matchingInvoiceOrders.map((order) => order.id));
+      }
+    }
 
     const filteredOrderIds = this.intersectIdSets(orderIdSets);
     if (filteredOrderIds) {
       where.id = { in: filteredOrderIds };
     }
+    const orderSort =
+      filters.orderSort === 'asc' || filters.orderSort === 'desc'
+        ? filters.orderSort
+        : null;
 
-    const orders = await this.prisma.order.findMany({
-      where,
-      orderBy: { createdAt: 'desc' },
-      take: 500,
-      select: {
-        externalOrderNumber: true,
-        orderDate: true,
-        invoiceReference: true,
-        status: true,
-        sourceSheet: true,
-        sourceRow: true,
-        store: { select: { name: true } },
-        lines: {
-          orderBy: { sourceRow: 'asc' },
-          select: {
-            sku: true,
-            quantity: true,
-            productCost: true,
-            shippingCost: true,
-            handlingCost: true,
-            totalCost: true,
-            lineType: true,
-            sourceSheet: true,
-            sourceRow: true,
-            product: {
-              select: {
-                id: true,
-                name: true,
-                description: true,
-                weight: true,
-                imageUrl: true,
-                skuAliases: {
-                  select: { sku: true, store: { select: { name: true } } },
-                  orderBy: { sku: 'asc' },
-                },
-                _count: {
-                  select: {
-                    orderLines: true,
-                    stockPurchases: true,
-                    inventoryMovements: true,
+    const pageSize = 100;
+    const requestedPage = Number.parseInt(String(filters.orderPage ?? ''), 10);
+    const page =
+      Number.isFinite(requestedPage) && requestedPage > 0 ? requestedPage : 1;
+    const hasDateFilter = Boolean(dateFilter || invoiceDateFilter);
+    const totalCostPromise = hasDateFilter
+      ? this.prisma.orderLine.aggregate({
+          where: { order: where },
+          _sum: { totalCost: true },
+        })
+      : Promise.resolve(null);
+
+    const [totalOrders, totalCostAggregate, orders] = await Promise.all([
+      this.prisma.order.count({ where }),
+      totalCostPromise,
+      this.prisma.order.findMany({
+        where,
+        // Imported rows share createdAt timestamps, so the default order
+        // follows the Excel file (sheet, then row); id keeps pagination
+        // stable as a final tiebreaker.
+        orderBy: orderSort
+          ? [
+              { externalOrderNumber: orderSort },
+              { createdAt: 'desc' },
+              { id: 'desc' },
+            ]
+          : [{ sourceSheet: 'asc' }, { sourceRow: 'asc' }, { id: 'asc' }],
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        select: {
+          externalOrderNumber: true,
+          orderDate: true,
+          invoiceReference: true,
+          country: true,
+          status: true,
+          sourceSheet: true,
+          sourceRow: true,
+          store: { select: { name: true } },
+          lines: {
+            orderBy: { sourceRow: 'asc' },
+            select: {
+              sku: true,
+              quantity: true,
+              productCost: true,
+              shippingCost: true,
+              handlingCost: true,
+              totalCost: true,
+              lineType: true,
+              sourceSheet: true,
+              sourceRow: true,
+              product: {
+                select: {
+                  id: true,
+                  name: true,
+                  description: true,
+                  weight: true,
+                  imageUrl: true,
+                  quotation: true,
+                  skuAliases: {
+                    select: { sku: true, store: { select: { name: true } } },
+                    orderBy: { sku: 'asc' },
+                  },
+                  _count: {
+                    select: {
+                      orderLines: true,
+                      stockPurchases: true,
+                      inventoryMovements: true,
+                    },
                   },
                 },
               },
             },
           },
+          shipments: {
+            orderBy: { trackingNumber: 'asc' },
+            select: { trackingNumber: true },
+          },
         },
-        shipments: {
-          orderBy: { trackingNumber: 'asc' },
-          select: { trackingNumber: true },
-        },
-      },
-    });
+      }),
+    ]);
 
     return {
       title: 'Order lines',
+      totalRows: totalOrders,
+      page,
+      pageSize,
+      meta: {
+        hasDateFilter,
+        totalCost: this.round(totalCostAggregate?._sum.totalCost ?? 0),
+      },
       columns: [
         { key: 'orderNumber', label: 'Order number' },
         { key: 'store', label: 'Store' },
         { key: 'invoice', label: 'Invoice' },
+        { key: 'country', label: 'Country' },
         { key: 'status', label: 'Status' },
         { key: 'date', label: 'Date' },
         { key: 'trackingNumbers', label: 'Tracking' },
@@ -880,15 +1103,18 @@ export class AppService {
       ],
       rows: orders.flatMap((order) => {
         const trackingNumbers =
-          order.shipments.map((shipment) => shipment.trackingNumber).join(', ') ||
-          '-';
+          order.shipments
+            .map((shipment) => shipment.trackingNumber)
+            .join(', ') || '-';
         const baseRow = {
           orderNumber: order.externalOrderNumber,
           store: order.store.name,
           invoice: order.invoiceReference,
+          country: order.country ?? '-',
           status: this.formatLabel(order.status),
           date: this.formatDateValue(order.orderDate),
           trackingNumbers,
+          refunded: order.lines.some((line) => line.lineType === 'refund'),
         };
 
         if (order.lines.length === 0) {
@@ -923,7 +1149,8 @@ export class AppService {
             ? this.productSummaryResponseRow(line.product)
             : {
                 name: line.sku,
-                description: 'No linked product details were found for this SKU.',
+                description:
+                  'No linked product details were found for this SKU.',
                 imageUrl: null,
                 skuAliases: [line.sku],
                 stores: [order.store.name],
@@ -959,43 +1186,158 @@ export class AppService {
       orderLines: product._count.orderLines,
       stockPurchases: product._count.stockPurchases,
       inventoryMovements: product._count.inventoryMovements,
-      quotation: null,
+      quotation: this.normalizeQuotationForResponse(product.quotation) ?? null,
     };
   }
 
-  private async getInventorySection(): Promise<DashboardSection> {
-    const movements = await this.prisma.inventoryMovement.findMany({
-      orderBy: { createdAt: 'desc' },
+  private async getProductMatchingSection(): Promise<DashboardSection> {
+    const links = await this.prisma.inventoryProductLink.findMany({
+      orderBy: [
+        { confirmedByAdmin: 'asc' },
+        { confidence: 'asc' },
+        { createdAt: 'desc' },
+      ],
       take: 500,
       select: {
-        movementDate: true,
-        movementType: true,
-        quantity: true,
-        reference: true,
-        product: { select: { name: true } },
-        store: { select: { name: true } },
+        id: true,
+        relationType: true,
+        quantityPerProduct: true,
+        confidence: true,
+        confirmedByAdmin: true,
+        inventoryItem: {
+          select: {
+            stockName: true,
+            sourceSheet: true,
+            importBatch: { select: { fileName: true } },
+          },
+        },
+        product: { select: { id: true, name: true } },
       },
     });
 
     return {
-      title: 'Inventory',
+      title: 'Product Matching Review',
       columns: [
-        { key: 'date', label: 'Date' },
-        { key: 'product', label: 'Product' },
-        { key: 'store', label: 'Store' },
-        { key: 'type', label: 'Type' },
-        { key: 'quantity', label: 'Quantity' },
-        { key: 'reference', label: 'Reference' },
+        { key: 'stockItemName', label: 'Stock item name' },
+        { key: 'suggestedProduct', label: 'Suggested product' },
+        { key: 'relationType', label: 'Relation type' },
+        { key: 'confidenceScore', label: 'Confidence score' },
+        { key: 'quantityPerProduct', label: 'Quantity per product' },
+        { key: 'confirmedByAdmin', label: 'Confirmed' },
       ],
-      rows: movements.map((movement) => ({
-        date: this.formatDateValue(movement.movementDate),
-        product: movement.product?.name ?? '-',
-        store: movement.store?.name ?? '-',
-        type: this.formatLabel(movement.movementType),
-        quantity: movement.quantity,
-        reference: movement.reference ?? '-',
+      rows: links.map((link) => ({
+        id: link.id,
+        stockItemName: link.inventoryItem.stockName,
+        suggestedProduct: link.product?.name ?? '-',
+        suggestedProductId: link.product?.id ?? null,
+        relationType: link.relationType,
+        confidenceScore: this.round(link.confidence),
+        quantityPerProduct: link.quantityPerProduct,
+        confirmedByAdmin: link.confirmedByAdmin,
+        sourceSheet: link.inventoryItem.sourceSheet ?? '-',
+        importFile: link.inventoryItem.importBatch.fileName,
       })),
     };
+  }
+
+  async updateProductMatch(
+    matchId: string,
+    action: 'confirm' | 'reject' | 'edit',
+    data: {
+      productName?: string;
+      relationType?: string;
+      quantityPerProduct?: number;
+    } = {},
+  ) {
+    if (!matchId) {
+      throw new Error('Product match ID is required.');
+    }
+
+    if (action === 'reject') {
+      return this.prisma.inventoryProductLink.update({
+        where: { id: matchId },
+        data: {
+          productId: null,
+          confidence: 0,
+          confirmedByAdmin: false,
+        },
+      });
+    }
+
+    const current = await this.prisma.inventoryProductLink.findUnique({
+      where: { id: matchId },
+      select: {
+        productId: true,
+        relationType: true,
+        quantityPerProduct: true,
+        inventoryItem: {
+          select: {
+            stockName: true,
+            normalizedName: true,
+            sourceSheet: true,
+          },
+        },
+      },
+    });
+    if (!current) {
+      throw new Error('Product match was not found.');
+    }
+
+    const product = data.productName
+      ? await this.prisma.product.findFirst({
+          where: {
+            name: { contains: data.productName, mode: 'insensitive' as const },
+          },
+          select: { id: true },
+        })
+      : current.productId
+        ? { id: current.productId }
+        : null;
+    if (!product) {
+      throw new Error('A matching catalog product is required.');
+    }
+
+    const relationType = this.normalizeRelationType(
+      data.relationType ?? current.relationType,
+    );
+    const quantityPerProduct =
+      Number(data.quantityPerProduct ?? current.quantityPerProduct) || 1;
+
+    await this.prisma.productAlias.upsert({
+      where: { normalizedName: current.inventoryItem.normalizedName },
+      update: {
+        productId: product.id,
+        aliasName: current.inventoryItem.stockName,
+        sourceSheet: current.inventoryItem.sourceSheet,
+        confidence: 1,
+        confirmedByAdmin: true,
+      },
+      create: {
+        productId: product.id,
+        aliasName: current.inventoryItem.stockName,
+        normalizedName: current.inventoryItem.normalizedName,
+        sourceSheet: current.inventoryItem.sourceSheet,
+        confidence: 1,
+        confirmedByAdmin: true,
+      },
+    });
+
+    return this.prisma.inventoryProductLink.update({
+      where: { id: matchId },
+      data: {
+        productId: product.id,
+        relationType,
+        quantityPerProduct,
+        confidence: 1,
+        confirmedByAdmin: true,
+      },
+    });
+  }
+
+  private normalizeRelationType(value: string) {
+    return ['alias', 'variant', 'component'].includes(value)
+      ? value
+      : 'alias';
   }
 
   private async getStoresSection(): Promise<DashboardSection> {
@@ -1145,9 +1487,15 @@ export class AppService {
   }
 
   private dateFilter(dateFrom?: string, dateTo?: string) {
-    const filter: { gte?: Date; lte?: Date } = {};
+    const filter: { gte?: Date; lt?: Date } = {};
     if (dateFrom) filter.gte = new Date(dateFrom);
-    if (dateTo) filter.lte = new Date(dateTo);
+    if (dateTo) {
+      // Order dates carry a time of day, so include the whole "to" day by
+      // bounding at the start of the next day (exclusive).
+      const endExclusive = new Date(dateTo);
+      endExclusive.setUTCDate(endExclusive.getUTCDate() + 1);
+      filter.lt = endExclusive;
+    }
     return Object.keys(filter).length ? filter : null;
   }
 

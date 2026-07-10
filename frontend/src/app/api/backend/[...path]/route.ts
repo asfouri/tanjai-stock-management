@@ -41,10 +41,18 @@ async function proxyRequest(request: Request, context: RouteContext) {
     body,
   });
 
+  // fetch already decompressed the backend response; forwarding the original
+  // content-encoding/length headers would make the browser decode plain JSON
+  // as gzip ("Decoding failed.").
+  const responseHeaders = new Headers(response.headers);
+  responseHeaders.delete("content-encoding");
+  responseHeaders.delete("content-length");
+  responseHeaders.delete("transfer-encoding");
+
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
-    headers: response.headers,
+    headers: responseHeaders,
   });
 }
 

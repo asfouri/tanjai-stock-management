@@ -37,6 +37,7 @@ export const emptySummary: DashboardSummary = {
     invoices: [],
     orderNumbers: [],
     trackingNumbers: [],
+    countries: [],
     dates: [],
   },
 };

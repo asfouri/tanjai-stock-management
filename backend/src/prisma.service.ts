@@ -37,12 +37,15 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
   readonly store: any;
   readonly product: any;
   readonly productSkuAlias: any;
+  readonly productAlias: any;
   readonly order: any;
   readonly orderLine: any;
   readonly shipment: any;
   readonly fulfillmentInvoice: any;
   readonly stockPurchase: any;
   readonly inventoryMovement: any;
+  readonly inventoryItem: any;
+  readonly inventoryProductLink: any;
   readonly walletTransaction: any;
   readonly anomaly: any;
 
@@ -55,6 +58,8 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
     this.product = this.client?.product ?? createMissingDelegate('product');
     this.productSkuAlias =
       this.client?.productSkuAlias ?? createMissingDelegate('productSkuAlias');
+    this.productAlias =
+      this.client?.productAlias ?? createMissingDelegate('productAlias');
     this.order = this.client?.order ?? createMissingDelegate('order');
     this.orderLine =
       this.client?.orderLine ?? createMissingDelegate('orderLine');
@@ -67,6 +72,11 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
     this.inventoryMovement =
       this.client?.inventoryMovement ??
       createMissingDelegate('inventoryMovement');
+    this.inventoryItem =
+      this.client?.inventoryItem ?? createMissingDelegate('inventoryItem');
+    this.inventoryProductLink =
+      this.client?.inventoryProductLink ??
+      createMissingDelegate('inventoryProductLink');
     this.walletTransaction =
       this.client?.walletTransaction ??
       createMissingDelegate('walletTransaction');

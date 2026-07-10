@@ -40,6 +40,53 @@ type UploadedExcelFile = {
 };
 
 type HeaderMap = Record<string, number>;
+type RelationType = 'alias' | 'variant' | 'component';
+type StockProductMatch = {
+  stockName: string;
+  productName?: string;
+  relationType: RelationType;
+  quantityPerProduct: number;
+  confidence: number;
+};
+
+const knownStockLinks: Array<{
+  stockName: string;
+  productName: string;
+  relationType: RelationType;
+  quantityPerProduct?: number;
+}> = [
+  {
+    stockName: 'Glassbrush',
+    productName: 'Old Glass-brush',
+    relationType: 'alias',
+  },
+  {
+    stockName: 'CarPlay3-in-1-Apple',
+    productName: 'CarPlay 3-in-1-Apple/Android(black/silver)',
+    relationType: 'variant',
+  },
+  {
+    stockName: 'CarPlay3-in-1-Android',
+    productName: 'CarPlay 3-in-1-Apple/Android(black/silver)',
+    relationType: 'variant',
+  },
+  {
+    stockName: 'CarPlay3-in-1-Android/Apple',
+    productName: 'CarPlay 3-in-1-Apple/Android(black/silver)',
+    relationType: 'variant',
+  },
+  {
+    stockName: 'Rags',
+    productName: 'Clip Hydromax+2 Rags',
+    relationType: 'component',
+    quantityPerProduct: 2,
+  },
+  {
+    stockName: 'knee pads',
+    productName: 'Black (knee pads + elbow pads)-Strap',
+    relationType: 'component',
+  },
+];
 
 const previewStore = new Map<
   string,
@@ -235,6 +282,7 @@ export class ExcelImportService {
                 externalOrderNumber: order.externalOrderNumber,
                 orderDate: order.orderDate,
                 invoiceReference: order.invoiceReference,
+                country: order.country,
                 status: order.status,
                 sourceSheet: order.sourceSheet,
                 sourceRow: order.sourceRow,
@@ -346,6 +394,13 @@ export class ExcelImportService {
             })),
           );
 
+          await this.persistInventoryProductMatches(
+            tx,
+            batch.id,
+            entry.parsed.inventoryMovements,
+            productIds,
+          );
+
           await this.createManyInChunks(
             tx.walletTransaction,
             entry.parsed.walletTransactions.map((transaction) => ({
@@ -435,6 +490,19 @@ export class ExcelImportService {
             });
           }
 
+          const inventoryItemIds = (
+            await tx.inventoryItem.findMany({
+              where: { importBatchId },
+              select: { id: true },
+            })
+          ).map((item) => item.id);
+          if (inventoryItemIds.length > 0) {
+            await tx.inventoryProductLink.deleteMany({
+              where: { inventoryItemId: { in: inventoryItemIds } },
+            });
+            await tx.inventoryItem.deleteMany({ where: { importBatchId } });
+          }
+
           const [
             deletedAnomalies,
             deletedWalletTransactions,
@@ -518,52 +586,58 @@ export class ExcelImportService {
         },
       });
 
-      const rows: Array<Record<string, unknown>> = [];
-      for (const batch of batches) {
-        const orderCount = await this.prisma.order.count({
-          where: { importBatchId: batch.id },
-        });
-        const invoiceCount = await this.prisma.fulfillmentInvoice.count({
-          where: { importBatchId: batch.id },
-        });
-        const stockPurchaseCount = await this.prisma.stockPurchase.count({
-          where: { importBatchId: batch.id },
-        });
-        const inventoryMovementCount =
-          await this.prisma.inventoryMovement.count({
-            where: { importBatchId: batch.id },
-          });
-        const walletTransactionCount =
-          await this.prisma.walletTransaction.count({
-            where: { importBatchId: batch.id },
-          });
-        const anomalyCount = await this.prisma.anomaly.count({
-          where: { importBatchId: batch.id },
-        });
+      const rows = await Promise.all(
+        batches.map(async (batch) => {
+          const [
+            orderCount,
+            invoiceCount,
+            stockPurchaseCount,
+            inventoryMovementCount,
+            walletTransactionCount,
+            anomalyCount,
+            productCount,
+          ] = await Promise.all([
+            this.prisma.order.count({ where: { importBatchId: batch.id } }),
+            this.prisma.fulfillmentInvoice.count({
+              where: { importBatchId: batch.id },
+            }),
+            this.prisma.stockPurchase.count({
+              where: { importBatchId: batch.id },
+            }),
+            this.prisma.inventoryMovement.count({
+              where: { importBatchId: batch.id },
+            }),
+            this.prisma.walletTransaction.count({
+              where: { importBatchId: batch.id },
+            }),
+            this.prisma.anomaly.count({ where: { importBatchId: batch.id } }),
+            this.countProductsForImportBatch(batch.id),
+          ]);
 
-        rows.push({
-          id: batch.id,
-          fileName: batch.fileName,
-          fileHash: batch.fileHash,
-          fileHashStatus: batch.fileHash ? 'Registered' : 'Missing',
-          status: batch.status,
-          importedAt: batch.createdAt,
-          orders: orderCount,
-          invoices: invoiceCount,
-          products: await this.countProductsForImportBatch(batch.id),
-          stockPurchases: stockPurchaseCount,
-          inventoryMovements: inventoryMovementCount,
-          walletTransactions: walletTransactionCount,
-          warnings: Array.isArray(batch.warnings)
-            ? batch.warnings.length
-            : anomalyCount,
-          anomalies: anomalyCount,
-          duplicates: Array.isArray(batch.duplicates)
-            ? batch.duplicates.length
-            : 0,
-          summary: batch.summary,
-        });
-      }
+          return {
+            id: batch.id,
+            fileName: batch.fileName,
+            fileHash: batch.fileHash,
+            fileHashStatus: batch.fileHash ? 'Registered' : 'Missing',
+            status: batch.status,
+            importedAt: batch.createdAt,
+            orders: orderCount,
+            invoices: invoiceCount,
+            products: productCount,
+            stockPurchases: stockPurchaseCount,
+            inventoryMovements: inventoryMovementCount,
+            walletTransactions: walletTransactionCount,
+            warnings: Array.isArray(batch.warnings)
+              ? batch.warnings.length
+              : anomalyCount,
+            anomalies: anomalyCount,
+            duplicates: Array.isArray(batch.duplicates)
+              ? batch.duplicates.length
+              : 0,
+            summary: batch.summary,
+          };
+        }),
+      );
 
       return rows;
     } catch (error) {
@@ -572,37 +646,32 @@ export class ExcelImportService {
   }
 
   private async countProductsForImportBatch(importBatchId: string) {
-    const productIds = new Set<string>();
-    const orders = await this.prisma.order.findMany({
-      where: { importBatchId },
-      select: {
-        lines: {
-          where: { productId: { not: null } },
+    const [lineProducts, purchaseProducts, movementProducts] =
+      await Promise.all([
+        this.prisma.orderLine.findMany({
+          where: { order: { importBatchId }, productId: { not: null } },
           select: { productId: true },
-        },
-      },
-    });
+          distinct: ['productId'],
+        }),
+        this.prisma.stockPurchase.findMany({
+          where: { importBatchId, productId: { not: null } },
+          select: { productId: true },
+          distinct: ['productId'],
+        }),
+        this.prisma.inventoryMovement.findMany({
+          where: { importBatchId, productId: { not: null } },
+          select: { productId: true },
+          distinct: ['productId'],
+        }),
+      ]);
 
-    for (const order of orders) {
-      for (const line of order.lines) {
-        if (line.productId) productIds.add(line.productId);
-      }
-    }
-
-    const stockPurchases = await this.prisma.stockPurchase.findMany({
-      where: { importBatchId, productId: { not: null } },
-      select: { productId: true },
-    });
-    for (const purchase of stockPurchases) {
-      if (purchase.productId) productIds.add(purchase.productId);
-    }
-
-    const movements = await this.prisma.inventoryMovement.findMany({
-      where: { importBatchId, productId: { not: null } },
-      select: { productId: true },
-    });
-    for (const movement of movements) {
-      if (movement.productId) productIds.add(movement.productId);
+    const productIds = new Set<string>();
+    for (const row of [
+      ...lineProducts,
+      ...purchaseProducts,
+      ...movementProducts,
+    ]) {
+      if (row.productId) productIds.add(row.productId);
     }
 
     return productIds.size;
@@ -774,7 +843,20 @@ export class ExcelImportService {
     if (updateName) data.name = product.name;
     if (product.description) data.description = product.description;
     if (typeof product.weight === 'number') data.weight = product.weight;
-    if (product.quotation) data.quotation = product.quotation;
+    if (product.quotation) {
+      // A product with several SKU aliases is saved once per alias; merge
+      // with the stored quotation so a later alias with partial data does
+      // not wipe rows contributed by earlier ones.
+      const existing = await tx.product.findUnique({
+        where: { id: productId },
+        select: { quotation: true },
+      });
+      data.quotation =
+        mergeProductQuotation(
+          (existing?.quotation ?? undefined) as ParsedProduct['quotation'],
+          product.quotation,
+        ) ?? product.quotation;
+    }
     if (product.imageUrl) data.imageUrl = product.imageUrl;
 
     if (Object.keys(data).length === 0) {
@@ -821,6 +903,8 @@ export class ExcelImportService {
         orderLines: { none: {} },
         stockPurchases: { none: {} },
         inventoryMovements: { none: {} },
+        aliases: { none: {} },
+        inventoryLinks: { none: {} },
       },
       select: {
         id: true,
@@ -895,6 +979,107 @@ export class ExcelImportService {
   ) {
     if (!sku) return undefined;
     return skuProductIds.get(sku) ?? skuProductIds.get(canonicalSkuKey(sku));
+  }
+
+  private async persistInventoryProductMatches(
+    tx: any,
+    importBatchId: string,
+    movements: ParsedInventoryMovement[],
+    productIds: Map<string, string>,
+  ) {
+    const stockItems = new Map<
+      string,
+      {
+        stockName: string;
+        normalizedName: string;
+        sourceSheet?: string;
+        productName?: string;
+        relationType: RelationType;
+        quantityPerProduct: number;
+        confidence: number;
+      }
+    >();
+
+    for (const movement of movements) {
+      const stockName = cleanText(movement.stockName ?? movement.productName);
+      if (!stockName) continue;
+      const normalizedName = normalizeInventoryName(stockName);
+      const existing = stockItems.get(normalizedName);
+      if (existing && existing.confidence >= (movement.confidence ?? 0)) {
+        continue;
+      }
+      stockItems.set(normalizedName, {
+        stockName,
+        normalizedName,
+        sourceSheet: movement.sourceSheet,
+        productName: movement.productName,
+        relationType: movement.relationType ?? 'alias',
+        quantityPerProduct: movement.quantityPerProduct ?? 1,
+        confidence: movement.confidence ?? 0,
+      });
+    }
+
+    if (stockItems.size === 0) return;
+
+    const savedAliases = await tx.productAlias.findMany({
+      where: { normalizedName: { in: [...stockItems.keys()] } },
+      select: {
+        normalizedName: true,
+        productId: true,
+        confidence: true,
+        confirmedByAdmin: true,
+        product: { select: { name: true } },
+      },
+    });
+    const savedAliasByName = new Map<
+      string,
+      {
+        productId: string;
+        confidence: number;
+        confirmedByAdmin: boolean;
+      }
+    >(
+      savedAliases.map((alias: any) => [alias.normalizedName, alias]),
+    );
+
+    for (const item of stockItems.values()) {
+      const savedAlias = savedAliasByName.get(item.normalizedName);
+      const productId =
+        savedAlias?.productId ??
+        this.lookupProductId(productIds, item.productName) ??
+        this.lookupProductId(productIds, item.stockName);
+      const inventoryItem = await tx.inventoryItem.upsert({
+        where: {
+          importBatchId_normalizedName: {
+            importBatchId,
+            normalizedName: item.normalizedName,
+          },
+        },
+        update: {
+          stockName: item.stockName,
+          sourceSheet: item.sourceSheet,
+        },
+        create: {
+          importBatchId,
+          stockName: item.stockName,
+          normalizedName: item.normalizedName,
+          sourceSheet: item.sourceSheet,
+        },
+      });
+
+      await tx.inventoryProductLink.create({
+        data: {
+          inventoryItemId: inventoryItem.id,
+          productId,
+          relationType: item.relationType,
+          quantityPerProduct: item.quantityPerProduct,
+          confidence: savedAlias?.confirmedByAdmin
+            ? Math.max(savedAlias.confidence ?? 1, item.confidence)
+            : item.confidence,
+          confirmedByAdmin: Boolean(savedAlias?.confirmedByAdmin),
+        },
+      });
+    }
   }
 
   private async createManyInChunks(
@@ -1152,7 +1337,9 @@ export class ExcelImportService {
     let lastProductName = '';
     let lastProductImageUrl: string | undefined;
     let skipAlternateLayout = false;
+    let currentGroup = '';
     const seenSkuNames = new Map<string, string>();
+    const deliveryTimeByRow = this.mergedDeliveryTimesByRow(sheet);
     const imageByRow =
       sheet.name === 'Quotation-NEW'
         ? this.quotationImagesByRow(sheet.images)
@@ -1188,12 +1375,44 @@ export class ExcelImportService {
       if (skipAlternateLayout) continue;
 
       const skus = splitSkuAliases(row.cells[4]);
-      const rawName = cleanText(row.cells[1]) || cleanText(row.cells[3]);
+      // Column B is the picture column, but some variant rows carry their
+      // label there instead of columns A/C (e.g. "1 Arme-Trainer-box+ ...").
+      const rawName =
+        cleanText(row.cells[1]) ||
+        cleanText(row.cells[3]) ||
+        cleanText(row.cells[2]);
       const nameInfo = cleanQuotationProductName(rawName);
-      const quotation = extractQuotationData(row, nameInfo, sheet.name);
+      const quotation = extractQuotationData(
+        row,
+        nameInfo,
+        sheet.name,
+        deliveryTimeByRow.get(row.rowNumber),
+      );
       const hasUsefulQuotation = hasUsefulQuotationData(quotation);
+
+      // Column A ("No.") labels each product block, e.g. "[CarPlay] 2" or
+      // "High-pressure car wash nozzles". Keep the full label (brackets
+      // removed, stock/MOQ noise stripped) so "[CarPlay]", "[CarPlay] 2" and
+      // "[CarPlay] 3" stay separate groups.
+      const groupLabel = quotationGroupLabel(row.cells[1]);
+      if (groupLabel) {
+        currentGroup = groupLabel;
+      }
+      if (currentGroup) {
+        quotation.productGroup = currentGroup;
+      }
+      // A bracket-only label in column A (e.g. "[CarPlay]") is a group label,
+      // not a product identity — several blocks can share it. Prefer the
+      // Details column for the product name when it provides one.
+      let resolvedName = nameInfo.name;
+      if (nameInfo.name && nameInfo.bracketOnly && cleanText(row.cells[1])) {
+        const detailsInfo = cleanQuotationProductName(row.cells[3]);
+        if (detailsInfo.name) {
+          resolvedName = detailsInfo.name;
+        }
+      }
       const name =
-        nameInfo.name ||
+        resolvedName ||
         ((skus.length === 0 || !rawName) && lastProductName
           ? lastProductName
           : '') ||
@@ -1227,7 +1446,9 @@ export class ExcelImportService {
           sourceSheet: sheet.name,
           sourceRow: row.rowNumber,
           severity: 'warning',
-          message: `Invalid delivery-time value treated as selling price: ${invalidDeliveryValue}`,
+          message: isPastedLandedCostPricing(row)
+            ? `Ignored landed cost pasted into the delivery-time column: ${invalidDeliveryValue}`
+            : `Invalid delivery-time value treated as selling price: ${invalidDeliveryValue}`,
         });
       }
 
@@ -1344,15 +1565,50 @@ export class ExcelImportService {
     return standard ? 'standard' : 'alternate';
   }
 
+  // The Delivery date column (Q) uses merged cells spanning each product
+  // block; Excel stores the value only in the top-left cell, so propagate it
+  // to every row the merge covers.
+  private mergedDeliveryTimesByRow(sheet: WorkbookSheet) {
+    const deliveryByRow = new Map<number, string>();
+    const rowsByNumber = new Map(sheet.rows.map((row) => [row.rowNumber, row]));
+
+    for (const merge of sheet.merges) {
+      if (merge.startColumn !== 17 || merge.endColumn !== 17) continue;
+
+      const anchorValue = cleanText(
+        rowsByNumber.get(merge.startRow)?.cells[17],
+      );
+      if (!anchorValue || !looksLikeDeliveryTime(anchorValue)) continue;
+
+      for (let row = merge.startRow; row <= merge.endRow; row += 1) {
+        deliveryByRow.set(row, anchorValue);
+      }
+    }
+
+    return deliveryByRow;
+  }
+
+  // Product pictures live in column B, but some are anchored one column off
+  // (e.g. an image whose top-left corner starts in column A). Accept columns
+  // A-C and prefer the column B anchor when a row has several images.
   private quotationImagesByRow(images: WorkbookImage[]) {
-    const imageByRow = new Map<number, string>();
+    const imageByRow = new Map<number, { column: number; dataUrl: string }>();
     for (const image of images) {
-      if (image.sourceColumn !== 2 || imageByRow.has(image.sourceRow)) {
+      if (image.sourceColumn < 1 || image.sourceColumn > 3) {
         continue;
       }
-      imageByRow.set(image.sourceRow, image.dataUrl);
+      const existing = imageByRow.get(image.sourceRow);
+      if (existing && (existing.column === 2 || image.sourceColumn !== 2)) {
+        continue;
+      }
+      imageByRow.set(image.sourceRow, {
+        column: image.sourceColumn,
+        dataUrl: image.dataUrl,
+      });
     }
-    return imageByRow;
+    return new Map(
+      [...imageByRow].map(([row, image]) => [row, image.dataUrl]),
+    );
   }
 
   private parseStoreOrders(
@@ -1401,14 +1657,47 @@ export class ExcelImportService {
         const quantity = toNumber(dataRow.cells[headers.quantity]) ?? 0;
         const totalCost = toNumber(dataRow.cells[headers.totalCost]) ?? 0;
 
+        // Refund rows have no Order No. cell but reference their order in a
+        // label like "1220-refund". Attach them to that order (reusing its
+        // product SKU) when it exists anywhere in this store's sheet;
+        // otherwise create a standalone refund order under that number.
+        const explicitOrderNumber = cleanText(
+          dataRow.cells[headers.orderNumber],
+        );
+        const refundLabelNumber = explicitOrderNumber
+          ? ''
+          : (this.rowText(dataRow).match(/#?(\d{2,})\s*[-–]?\s*refund/i)?.[1] ??
+            '');
+        const refundOrderNumber = refundLabelNumber;
+        let refundSourceSku = '';
+        if (refundLabelNumber) {
+          const referencedOrder =
+            orders.get(`${refundLabelNumber}|${invoiceReference}`) ??
+            this.findStoreOrder(parsed.orders, sheet.name, refundLabelNumber);
+          if (referencedOrder) {
+            refundSourceSku =
+              referencedOrder.lines.find((line) => line.lineType === 'product')
+                ?.sku ?? '';
+          } else {
+            parsed.warnings.push({
+              sourceSheet: sheet.name,
+              sourceRow: dataRow.rowNumber,
+              severity: 'info',
+              message: `Refund references order ${refundLabelNumber} which has no other rows in this sheet; kept as a standalone refund order.`,
+            });
+          }
+        }
+
         if (!sku && (quantity !== 0 || totalCost !== 0)) {
-          sku = 'UNSPECIFIED';
-          parsed.warnings.push({
-            sourceSheet: sheet.name,
-            sourceRow: dataRow.rowNumber,
-            severity: 'warning',
-            message: 'Order line has quantity or cost but no SKU.',
-          });
+          sku = refundSourceSku || 'UNSPECIFIED';
+          if (sku === 'UNSPECIFIED') {
+            parsed.warnings.push({
+              sourceSheet: sheet.name,
+              sourceRow: dataRow.rowNumber,
+              severity: 'warning',
+              message: 'Order line has quantity or cost but no SKU.',
+            });
+          }
         }
 
         if (!sku || (quantity === 0 && totalCost === 0)) {
@@ -1417,7 +1706,7 @@ export class ExcelImportService {
         }
 
         const orderNumber =
-          cleanText(dataRow.cells[headers.orderNumber]) || lastOrderNumber;
+          explicitOrderNumber || refundOrderNumber || lastOrderNumber;
         const trackingNumber = cleanText(dataRow.cells[headers.trackingNumber]);
 
         if (!orderNumber) {
@@ -1432,11 +1721,16 @@ export class ExcelImportService {
           continue;
         }
 
-        lastOrderNumber = orderNumber;
+        if (!refundOrderNumber) {
+          lastOrderNumber = orderNumber;
+        }
 
         const productCost = toNumber(dataRow.cells[headers.productCost]) ?? 0;
         const shippingCost = toNumber(dataRow.cells[headers.shippingCost]) ?? 0;
         const handlingCost = toNumber(dataRow.cells[headers.handlingCost]) ?? 0;
+        const country = headers.country
+          ? cleanText(dataRow.cells[headers.country])
+          : '';
         const orderDate = parseDateLike(dataRow.cells[headers.time]);
         const estimatedDelivery = headers.deliveryTime
           ? parseDateLike(dataRow.cells[headers.deliveryTime])
@@ -1459,6 +1753,7 @@ export class ExcelImportService {
             externalOrderNumber: orderNumber,
             orderDate,
             invoiceReference,
+            country: country || undefined,
             status: 'PENDING_TRACKING',
             sourceSheet: sheet.name,
             sourceRow: dataRow.rowNumber,
@@ -1500,7 +1795,10 @@ export class ExcelImportService {
 
       parsed.orders.push(...orders.values());
       for (const order of orders.values()) {
-        if (order.shipments.length === 0) {
+        const isRefundOnly = order.lines.every(
+          (line) => line.lineType === 'refund',
+        );
+        if (order.shipments.length === 0 && !isRefundOnly) {
           parsed.warnings.push({
             sourceSheet: order.sourceSheet,
             sourceRow: order.sourceRow,
@@ -1626,7 +1924,7 @@ export class ExcelImportService {
     parsed: ParsedImport,
     productKeys: Set<string>,
   ) {
-    const productByColumn = new Map<number, string>();
+    const productByColumn = new Map<number, StockProductMatch>();
     const headerRow = sheet.rows[0];
 
     if (headerRow) {
@@ -1635,11 +1933,22 @@ export class ExcelImportService {
         const productName =
           cleanQuotationProductName(rawProductName).name || rawProductName;
         if (productName && isUsefulQuotationProductName(productName)) {
-          productByColumn.set(Number(column), productName);
-          this.addProduct(parsed, productKeys, {
-            name: productName,
-            source: 'stock_header',
-          });
+          const match = this.matchStockProduct(parsed.products, productName);
+          productByColumn.set(Number(column), match);
+          if (match.productName) {
+            this.addProduct(parsed, productKeys, {
+              name: match.productName,
+              source: 'stock_header',
+            });
+          }
+          if (!match.productName || match.confidence < 0.8) {
+            parsed.warnings.push({
+              sourceSheet: sheet.name,
+              sourceRow: headerRow.rowNumber,
+              severity: 'warning',
+              message: `Stock item "${productName}" needs product matching review.`,
+            });
+          }
         } else if (rawProductName) {
           parsed.warnings.push({
             sourceSheet: sheet.name,
@@ -1679,6 +1988,7 @@ export class ExcelImportService {
             : 'inbound';
 
         parsed.inventoryMovements.push({
+          stockName: productColumn.stockName,
           productName: productColumn.productName,
           movementDate:
             parseDateLike(row.cells[productColumn.headerColumn - 1]) ??
@@ -1689,6 +1999,9 @@ export class ExcelImportService {
             ? cellRef
             : cleanText(row.cells[column - 1]) || undefined,
           comment,
+          relationType: productColumn.relationType,
+          quantityPerProduct: productColumn.quantityPerProduct,
+          confidence: productColumn.confidence,
           sourceSheet: sheet.name,
           sourceRow: row.rowNumber,
         });
@@ -1700,9 +2013,11 @@ export class ExcelImportService {
 
       const column = columnToNumber(cellRef);
       const rowNumber = Number(cellRef.match(/\d+/)?.[0] ?? 0);
-      const productName =
-        this.findProductForStockColumn(productByColumn, column)?.productName ??
-        undefined;
+      const productColumn = this.findProductForStockColumn(
+        productByColumn,
+        column,
+      );
+      const productName = productColumn?.productName ?? undefined;
       const movementType = classifyMovement(comment);
       const quantity = extractFirstNumber(comment);
 
@@ -1717,12 +2032,16 @@ export class ExcelImportService {
       }
 
       parsed.inventoryMovements.push({
+        stockName: productColumn?.stockName ?? productName,
         productName,
         movementDate: parseDateLike(comment) ?? undefined,
         movementType,
         quantity: Math.abs(quantity),
         reference: cellRef,
         comment,
+        relationType: productColumn?.relationType ?? 'alias',
+        quantityPerProduct: productColumn?.quantityPerProduct ?? 1,
+        confidence: productColumn?.confidence ?? (productName ? 0.8 : 0),
         sourceSheet: sheet.name,
         sourceRow: rowNumber,
       });
@@ -2072,6 +2391,52 @@ export class ExcelImportService {
     return headers;
   }
 
+  // Loose product-name match: squashed containment ("glassbrush" in
+  // "oldglassbrush") or every header token appearing in the squashed
+  // candidate name ("carplay3", "android", "apple" all inside
+  // "carplay3in1appleandroidblacksilver"). Prefers the shortest candidate.
+  private findQuotationProductByLooseName(
+    products: ParsedProduct[],
+    name: string,
+  ) {
+    const target = squashProductName(name);
+    const tokens = looseNameTokens(name);
+    if (target.length < 4 || tokens.length === 0) return undefined;
+
+    const candidates = products.filter((product) => {
+      if (product.source !== 'quotation') return false;
+      const candidate = squashProductName(product.name);
+      if (candidate.length < 4) return false;
+      if (candidate.includes(target) || target.includes(candidate)) {
+        return true;
+      }
+      return tokens.every((token) => candidate.includes(token));
+    });
+
+    return candidates.sort(
+      (left, right) =>
+        squashProductName(left.name).length -
+        squashProductName(right.name).length,
+    )[0];
+  }
+
+  private findStoreOrder(
+    parsedOrders: ParsedOrder[],
+    storeName: string,
+    orderNumber: string,
+  ) {
+    for (let index = parsedOrders.length - 1; index >= 0; index -= 1) {
+      const order = parsedOrders[index];
+      if (
+        order.storeName === storeName &&
+        order.externalOrderNumber === orderNumber
+      ) {
+        return order;
+      }
+    }
+    return undefined;
+  }
+
   private findTitleRow(rows: WorkbookRow[], headerIndex: number) {
     for (
       let index = headerIndex - 1;
@@ -2180,6 +2545,91 @@ export class ExcelImportService {
     return Object.values(row.cells).map(cleanText).join(' ').toLowerCase();
   }
 
+  private matchStockProduct(
+    products: ParsedProduct[],
+    stockName: string,
+  ): StockProductMatch {
+    const known = knownStockLinks.find(
+      (item) =>
+        normalizeInventoryName(item.stockName) ===
+        normalizeInventoryName(stockName),
+    );
+    const quotationProducts = products.filter(
+      (product) => product.source === 'quotation',
+    );
+    const findKnownProduct = (name: string) =>
+      quotationProducts.find(
+        (product) =>
+          normalizeInventoryName(product.name) === normalizeInventoryName(name),
+      ) ?? this.findQuotationProductByLooseName(products, name);
+
+    if (known) {
+      const product = findKnownProduct(known.productName);
+      return {
+        stockName,
+        productName: product?.name ?? known.productName,
+        relationType: known.relationType,
+        quantityPerProduct: known.quantityPerProduct ?? 1,
+        confidence: product ? 0.99 : 0.85,
+      };
+    }
+
+    const normalizedStock = normalizeInventoryName(stockName);
+    const exact = quotationProducts.find(
+      (product) => normalizeInventoryName(product.name) === normalizedStock,
+    );
+    if (exact) {
+      return {
+        stockName,
+        productName: exact.name,
+        relationType: 'alias',
+        quantityPerProduct: 1,
+        confidence: 0.95,
+      };
+    }
+
+    const component = this.findComponentProduct(quotationProducts, stockName);
+    if (component) {
+      return {
+        stockName,
+        productName: component.name,
+        relationType: 'component',
+        quantityPerProduct: inferQuantityPerProduct(stockName, component.name),
+        confidence: 0.82,
+      };
+    }
+
+    const fuzzy = this.findQuotationProductByLooseName(products, stockName);
+    if (fuzzy) {
+      return {
+        stockName,
+        productName: fuzzy.name,
+        relationType: 'variant',
+        quantityPerProduct: 1,
+        confidence: 0.72,
+      };
+    }
+
+    return {
+      stockName,
+      relationType: 'alias',
+      quantityPerProduct: 1,
+      confidence: 0,
+    };
+  }
+
+  private findComponentProduct(products: ParsedProduct[], stockName: string) {
+    const tokens = looseNameTokens(stockName).filter((token) => token.length > 2);
+    if (tokens.length === 0) return undefined;
+
+    return products
+      .filter((product) => {
+        const candidate = looseNameTokens(product.name);
+        return tokens.every((token) => candidate.includes(token));
+      })
+      .sort((left, right) => right.name.length - left.name.length)[0];
+  }
+
   private hasStoreOrderHeader(value: string) {
     const text = normalizeText(value);
     return (
@@ -2198,16 +2648,14 @@ export class ExcelImportService {
   }
 
   private findProductForStockColumn(
-    productByColumn: Map<number, string>,
+    productByColumn: Map<number, StockProductMatch>,
     column: number,
   ) {
     const match = [...productByColumn.entries()]
       .filter(([productColumn]) => productColumn <= column)
       .sort(([left], [right]) => right - left)[0];
 
-    return match
-      ? { headerColumn: match[0], productName: match[1] }
-      : undefined;
+    return match ? { headerColumn: match[0], ...match[1] } : undefined;
   }
 
   private lookupStoreId(storeIds: Map<string, string>, storeName: string) {
@@ -2271,9 +2719,50 @@ function normalizeDecoderText(value: unknown) {
     .trim();
 }
 
+function squashProductName(value: string) {
+  return normalizeText(value)
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function looseNameTokens(value: string) {
+  return normalizeText(value)
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length > 0);
+}
+
+function normalizeInventoryName(value: unknown) {
+  return cleanText(value)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .replace(/[-/()_[\]+]+/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function inferQuantityPerProduct(stockName: string, productName: string) {
+  const stockTokens = looseNameTokens(stockName);
+  for (const token of stockTokens) {
+    const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const before = productName.match(new RegExp(`(\\d+)\\s*${escaped}`, 'i'));
+    if (before) return Number(before[1]);
+    const after = productName.match(new RegExp(`${escaped}\\s*\\+\\s*(\\d+)`, 'i'));
+    if (after) return Number(after[1]);
+  }
+  return 1;
+}
+
 function canonicalSkuKey(value: unknown) {
   const sku = cleanText(value);
-  const match = sku.match(/-(\d+)\s*$/);
+  // Only treat long trailing digit codes as canonical (e.g. 12848-12765 ->
+  // 12765); short suffixes like Boltwave-PRO-001 / Hydromax-KIT-001 would
+  // collide on "001" and merge unrelated products.
+  const match = sku.match(/-(\d{4,})\s*$/);
   return match?.[1] ?? sku;
 }
 
@@ -2298,6 +2787,7 @@ type QuotationData = NonNullable<ParsedProduct['quotation']>;
 
 type QuotationNameInfo = {
   name?: string;
+  bracketOnly?: boolean;
   warning?: boolean;
   moq?: string;
   retired?: boolean;
@@ -2355,11 +2845,37 @@ function cleanQuotationProductName(value: unknown): QuotationNameInfo {
     info.name = candidates.join(' ');
   } else if (bracketCandidates.length > 0) {
     info.name = bracketCandidates.join(' ');
+    info.bracketOnly = true;
   } else {
     info.warning = !isNumericText(text);
   }
 
   return info;
+}
+
+function quotationGroupLabel(value: unknown) {
+  for (const rawLine of String(value ?? '').split(/\r?\n/)) {
+    let line = cleanText(rawLine);
+    if (!line) continue;
+
+    line = line.replace(/\[([^\]]+)\]/g, '$1');
+    line = line.replace(/MOQ\s*\d+\s*pcs?\s*[:：-]?/gi, ' ');
+    line = line.replace(/factory\s+have\s+prepare\s+stock/gi, ' ');
+    line = line.replace(/have\s+prepare\s+stock/gi, ' ');
+    line = line.replace(/have\s+stock/gi, ' ');
+    line = line.replace(/stock\s+at\s+warehouse/gi, ' ');
+    line = line.replace(/will\s+(be\s+)?removed/gi, ' ');
+    line = cleanText(line.replace(/[：:]+$/g, ''));
+
+    if (
+      line &&
+      !isNumericText(line) &&
+      !isQuotationContinuationQuantityLabel(line)
+    ) {
+      return line;
+    }
+  }
+  return '';
 }
 
 function cleanQuotationDescription(value: unknown, productName: string) {
@@ -2377,6 +2893,7 @@ function extractQuotationData(
   row: WorkbookRow,
   nameInfo: QuotationNameInfo,
   sheetName: string,
+  mergedDeliveryTime?: string,
 ): QuotationData {
   const quotation: QuotationData = {};
   const quantity = toNumber(row.cells[5]);
@@ -2385,7 +2902,13 @@ function extractQuotationData(
   const weightText = cleanText(row.cells[7]);
   const serviceFee = toNumber(row.cells[12]);
   const landedCost = toNumber(row.cells[13]);
-  const deliveryOrSelling = cleanText(row.cells[17]);
+  // When the GB/USA landed costs were pasted into columns Q/R, ignore the
+  // delivery-time copy (Q) but keep column R: it is the Selling price column
+  // and its value is what the sheet displays as selling price.
+  const pastedLandedCost = isPastedLandedCostPricing(row);
+  const deliveryOrSelling = pastedLandedCost
+    ? (mergedDeliveryTime ?? '')
+    : cleanText(row.cells[17]) || (mergedDeliveryTime ?? '');
   const explicitSellingPrice = toNumber(row.cells[18]);
   const notes = [...nameInfo.notes];
   const stockNotes = [...nameInfo.stockNotes];
@@ -2689,6 +3212,28 @@ function isUsefulQuotationProductName(value: string) {
 function extractMoqText(value: string) {
   const match = cleanText(value).match(/MOQ\s*\d+\s*pcs?/i);
   return match?.[0];
+}
+
+// Some quotation rows have the GB/USA landed costs pasted into the
+// Delivery date (Q) and Selling price (R) columns. When both values exactly
+// mirror the row's own landed costs they are copies, not a selling price.
+function isPastedLandedCostPricing(row: WorkbookRow) {
+  const deliveryText = cleanText(row.cells[17]);
+  if (!deliveryText || looksLikeDeliveryTime(deliveryText)) return false;
+
+  const deliveryValue = toNumber(deliveryText);
+  const sellingValue = toNumber(row.cells[18]);
+  const landedCostGB = toNumber(row.cells[15]);
+  const landedCostUSA = toNumber(row.cells[16]);
+
+  return (
+    deliveryValue !== null &&
+    sellingValue !== null &&
+    landedCostGB !== null &&
+    landedCostUSA !== null &&
+    deliveryValue === landedCostGB &&
+    sellingValue === landedCostUSA
+  );
 }
 
 function looksLikeDeliveryTime(value: string) {

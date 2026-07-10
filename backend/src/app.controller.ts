@@ -61,6 +61,29 @@ export class AppController {
     return this.appService.getDashboardSection(section, filters);
   }
 
+  @Post('product-matches/:id')
+  @UseGuards(SupabaseAuthGuard)
+  updateProductMatch(
+    @Param('id') id: string,
+    @Body('action') action: 'confirm' | 'reject' | 'edit',
+    @Body() body: Record<string, unknown>,
+  ) {
+    if (!['confirm', 'reject', 'edit'].includes(action)) {
+      throw new BadRequestException('Invalid product match action.');
+    }
+
+    return this.appService.updateProductMatch(id, action, {
+      productName:
+        typeof body.productName === 'string' ? body.productName : undefined,
+      relationType:
+        typeof body.relationType === 'string' ? body.relationType : undefined,
+      quantityPerProduct:
+        typeof body.quantityPerProduct === 'number'
+          ? body.quantityPerProduct
+          : undefined,
+    });
+  }
+
   @Post('imports/excel/preview')
   @UseGuards(SupabaseAuthGuard)
   async previewExcelImport(

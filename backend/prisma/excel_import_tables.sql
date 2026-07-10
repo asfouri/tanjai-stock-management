@@ -70,6 +70,24 @@ create unique index if not exists excel_product_sku_aliases_sku_key
 create index if not exists excel_product_sku_aliases_sku_idx
   on public.excel_product_sku_aliases (sku);
 
+create table if not exists public.excel_product_aliases (
+  id text primary key default gen_random_uuid()::text,
+  "productId" text not null references public.excel_products(id),
+  "aliasName" text not null,
+  "normalizedName" text not null,
+  "sourceSheet" text,
+  confidence double precision not null default 1,
+  "confirmedByAdmin" boolean not null default false,
+  "createdAt" timestamptz not null default now(),
+  "updatedAt" timestamptz not null default now()
+);
+
+create unique index if not exists excel_product_aliases_normalized_name_key
+  on public.excel_product_aliases ("normalizedName");
+
+create index if not exists excel_product_aliases_alias_name_idx
+  on public.excel_product_aliases ("aliasName");
+
 create table if not exists public.excel_orders (
   id text primary key default gen_random_uuid()::text,
   "importBatchId" text not null references public.excel_import_batches(id),
@@ -77,6 +95,7 @@ create table if not exists public.excel_orders (
   "externalOrderNumber" text not null,
   "orderDate" timestamptz,
   "invoiceReference" text not null,
+  country text,
   status text not null default 'CONFIRMED',
   "sourceSheet" text not null,
   "sourceRow" integer not null,
@@ -178,6 +197,40 @@ create table if not exists public.excel_inventory_movements (
 create index if not exists excel_inventory_movements_movement_type_idx
   on public.excel_inventory_movements ("movementType");
 
+create table if not exists public.excel_inventory_items (
+  id text primary key default gen_random_uuid()::text,
+  "stockName" text not null,
+  "normalizedName" text not null,
+  "sourceSheet" text,
+  "importBatchId" text not null references public.excel_import_batches(id),
+  "createdAt" timestamptz not null default now(),
+  "updatedAt" timestamptz not null default now()
+);
+
+create unique index if not exists excel_inventory_items_import_normalized_key
+  on public.excel_inventory_items ("importBatchId", "normalizedName");
+
+create index if not exists excel_inventory_items_normalized_name_idx
+  on public.excel_inventory_items ("normalizedName");
+
+create table if not exists public.excel_inventory_product_links (
+  id text primary key default gen_random_uuid()::text,
+  "inventoryItemId" text not null references public.excel_inventory_items(id),
+  "productId" text references public.excel_products(id),
+  "relationType" text not null,
+  "quantityPerProduct" double precision not null default 1,
+  confidence double precision not null default 0,
+  "confirmedByAdmin" boolean not null default false,
+  "createdAt" timestamptz not null default now(),
+  "updatedAt" timestamptz not null default now()
+);
+
+create index if not exists excel_inventory_product_links_confirmed_idx
+  on public.excel_inventory_product_links ("confirmedByAdmin");
+
+create index if not exists excel_inventory_product_links_relation_type_idx
+  on public.excel_inventory_product_links ("relationType");
+
 create table if not exists public.excel_wallet_transactions (
   id text primary key default gen_random_uuid()::text,
   "importBatchId" text not null references public.excel_import_batches(id),
@@ -213,6 +266,12 @@ create table if not exists public.excel_anomalies (
 
 alter table public.excel_orders
   add column if not exists status text not null default 'CONFIRMED';
+
+alter table public.excel_orders
+  add column if not exists country text;
+
+create index if not exists excel_orders_country_idx
+  on public.excel_orders (country);
 
 alter table public.excel_order_lines
   add column if not exists "lineType" text not null default 'product';

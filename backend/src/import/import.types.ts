@@ -28,6 +28,7 @@ export type ParsedProduct = {
   imageUrl?: string;
   source?: 'quotation' | 'fallback' | 'stock_header';
   quotation?: {
+    productGroup?: string;
     unitPrice?: number;
     weight?: number;
     moq?: string;
@@ -92,6 +93,7 @@ export type ParsedOrder = SourceRef & {
   externalOrderNumber: string;
   orderDate?: Date;
   invoiceReference: string;
+  country?: string;
   status: 'CONFIRMED' | 'PENDING_TRACKING';
   lines: ParsedOrderLine[];
   shipments: ParsedShipment[];
@@ -118,6 +120,7 @@ export type ParsedStockPurchase = SourceRef & {
 };
 
 export type ParsedInventoryMovement = SourceRef & {
+  stockName?: string;
   productName?: string;
   storeName?: string;
   movementDate?: Date;
@@ -125,6 +128,9 @@ export type ParsedInventoryMovement = SourceRef & {
   quantity: number;
   reference?: string;
   comment?: string;
+  relationType?: 'alias' | 'variant' | 'component';
+  quantityPerProduct?: number;
+  confidence?: number;
 };
 
 export type ParsedWalletTransaction = SourceRef & {

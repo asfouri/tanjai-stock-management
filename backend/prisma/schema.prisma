@@ -24,6 +24,7 @@ model ImportBatch {
   inventoryMovements  InventoryMovement[]
   walletTransactions  WalletTransaction[]
   anomalies           Anomaly[]
+  inventoryItems      InventoryItem[]
 
   @@map("excel_import_batches")
   @@schema("public")
@@ -73,9 +74,11 @@ model Product {
   createdAt   DateTime @default(now())
 
   skuAliases         ProductSkuAlias[]
+  aliases            ProductAlias[]
   orderLines         OrderLine[]
   stockPurchases     StockPurchase[]
   inventoryMovements InventoryMovement[]
+  inventoryLinks     InventoryProductLink[]
 
   @@unique([name])
   @@map("excel_products")
@@ -98,6 +101,25 @@ model ProductSkuAlias {
   @@schema("public")
 }
 
+model ProductAlias {
+  id               String   @id @default(uuid())
+  productId        String
+  aliasName        String
+  normalizedName   String
+  sourceSheet      String?
+  confidence       Float    @default(1)
+  confirmedByAdmin Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id])
+
+  @@unique([normalizedName])
+  @@index([aliasName])
+  @@map("excel_product_aliases")
+  @@schema("public")
+}
+
 model Order {
   id                  String    @id @default(uuid())
   importBatchId       String
@@ -105,6 +127,7 @@ model Order {
   externalOrderNumber String
   orderDate           DateTime?
   invoiceReference    String
+  country             String?
   status              String    @default("CONFIRMED")
   sourceSheet         String
   sourceRow           Int
@@ -224,6 +247,44 @@ model InventoryMovement {
 
   @@index([movementType])
   @@map("excel_inventory_movements")
+  @@schema("public")
+}
+
+model InventoryItem {
+  id             String   @id @default(uuid())
+  stockName      String
+  normalizedName String
+  sourceSheet    String?
+  importBatchId  String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  importBatch ImportBatch            @relation(fields: [importBatchId], references: [id])
+  links       InventoryProductLink[]
+
+  @@unique([importBatchId, normalizedName])
+  @@index([normalizedName])
+  @@map("excel_inventory_items")
+  @@schema("public")
+}
+
+model InventoryProductLink {
+  id                 String   @id @default(uuid())
+  inventoryItemId    String
+  productId          String?
+  relationType       String
+  quantityPerProduct Float    @default(1)
+  confidence         Float    @default(0)
+  confirmedByAdmin   Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  inventoryItem InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  product       Product?      @relation(fields: [productId], references: [id])
+
+  @@index([confirmedByAdmin])
+  @@index([relationType])
+  @@map("excel_inventory_product_links")
   @@schema("public")
 }
 
