@@ -118,18 +118,42 @@ export type Filters = {
   country: string;
   orderSearch: string;
   orderSort: "asc" | "desc" | "";
+  paymentType: "Deposit" | "Spent" | "";
+};
+
+export type AuthenticatedUser = {
+  id?: string;
+  email: string;
+  role: string;
+  storeIds: string[];
+};
+
+export type ManagedUser = {
+  id: string;
+  name: string;
+  email: string;
+  role: string;
+  storeIds: string[];
+  createdAt: string;
+  lastSignInAt: string | null;
+};
+
+export type UserStoreOption = {
+  id: string;
+  name: string;
 };
 
 export type SectionId =
   | "dashboard"
   | "imports"
   | "products"
+  | "products-without-skus"
   | "orders"
   | "inventory"
-  | "product-matching"
   | "stores"
   | "invoices"
-  | "payments";
+  | "payments"
+  | "users";
 
 export type SectionData = {
   title: string;
@@ -210,6 +234,7 @@ export type ProductMovement = {
 
 export type ProductRow = {
   id?: string;
+  inventoryItemId?: string;
   name: string;
   description?: string;
   imageUrl?: string | null;

@@ -12,6 +12,16 @@ function buildBackendUrl(path: string[] | undefined, requestUrl: string) {
   return `${backendBaseUrl}/${backendPath}${url.search}`;
 }
 
+function localFallbackUrl(url: string) {
+  if (url.startsWith("http://localhost:")) {
+    return url.replace("http://localhost:", "http://127.0.0.1:");
+  }
+  if (url.startsWith("http://127.0.0.1:")) {
+    return url.replace("http://127.0.0.1:", "http://localhost:");
+  }
+  return null;
+}
+
 async function proxyRequest(request: Request, context: RouteContext) {
   const { path } = await context.params;
   const headers = new Headers(request.headers);
@@ -35,11 +45,31 @@ async function proxyRequest(request: Request, context: RouteContext) {
       ? undefined
       : await request.arrayBuffer();
 
-  const response = await fetch(buildBackendUrl(path, request.url), {
-    method,
-    headers,
-    body,
-  });
+  const backendUrl = buildBackendUrl(path, request.url);
+  const fallbackUrl = localFallbackUrl(backendUrl);
+  let response: Response;
+
+  try {
+    response = await fetch(backendUrl, {
+      method,
+      headers,
+      body,
+    });
+  } catch (error) {
+    if (!fallbackUrl) {
+      return backendUnavailableResponse(error);
+    }
+
+    try {
+      response = await fetch(fallbackUrl, {
+        method,
+        headers,
+        body,
+      });
+    } catch (fallbackError) {
+      return backendUnavailableResponse(fallbackError);
+    }
+  }
 
   // fetch already decompressed the backend response; forwarding the original
   // content-encoding/length headers would make the browser decode plain JSON
@@ -56,10 +86,31 @@ async function proxyRequest(request: Request, context: RouteContext) {
   });
 }
 
+function backendUnavailableResponse(error: unknown) {
+  const details = error instanceof Error ? error.message : String(error);
+
+  return Response.json(
+    {
+      message:
+        "Cannot reach the backend server. Start the backend on port 3005, then refresh the dashboard.",
+      details,
+    },
+    { status: 502 },
+  );
+}
+
 export function GET(request: Request, context: RouteContext) {
   return proxyRequest(request, context);
 }
 
 export function POST(request: Request, context: RouteContext) {
+  return proxyRequest(request, context);
+}
+
+export function PATCH(request: Request, context: RouteContext) {
+  return proxyRequest(request, context);
+}
+
+export function DELETE(request: Request, context: RouteContext) {
   return proxyRequest(request, context);
 }

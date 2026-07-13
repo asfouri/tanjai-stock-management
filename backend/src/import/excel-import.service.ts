@@ -5,7 +5,7 @@ import {
 } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { gzip } from 'node:zlib';
-import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { basename, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { PrismaService } from '../prisma.service';
@@ -43,6 +43,8 @@ type HeaderMap = Record<string, number>;
 type RelationType = 'alias' | 'variant' | 'component';
 type StockProductMatch = {
   stockName: string;
+  stockSku?: string;
+  dateColumn?: number;
   productName?: string;
   relationType: RelationType;
   quantityPerProduct: number;
@@ -183,13 +185,17 @@ export class ExcelImportService {
 
       const existingBatch = await this.prisma.importBatch.findUnique({
         where: { fileHash: entry.parsed.fileHash },
-        select: { id: true },
+        select: { id: true, fileName: true },
       });
 
       if (existingBatch) {
-        throw new BadRequestException(
-          'This exact Excel file was already imported.',
-        );
+        previewStore.delete(token);
+        return {
+          importBatchId: existingBatch.id,
+          summary: entry.preview,
+          ignored: true,
+          message: `An identical copy of ${existingBatch.fileName} was already imported. No data was added.`,
+        };
       }
     } catch (error) {
       this.throwConfirmImportError(error);
@@ -198,6 +204,16 @@ export class ExcelImportService {
     let result: { importBatchId: string; summary: ImportPreview };
 
     try {
+      const confirmStartedAt = Date.now();
+      let phaseStartedAt = confirmStartedAt;
+      const logPhase = (phase: string) => {
+        const now = Date.now();
+        console.info(
+          `[excel-import] confirm ${phase}: ${now - phaseStartedAt}ms (${now - confirmStartedAt}ms total)`,
+        );
+        phaseStartedAt = now;
+      };
+
       result = await this.prisma.$transaction(
         async (tx) => {
           const batch = await tx.importBatch.create({
@@ -209,6 +225,7 @@ export class ExcelImportService {
               duplicates: entry.preview.duplicateRecords,
             },
           });
+          logPhase('batch');
 
           const brandName = entry.parsed.brandName || 'TanjAI';
           const brand = await tx.brand.upsert({
@@ -242,6 +259,7 @@ export class ExcelImportService {
             storeIds.set(store.name, saved.id);
             storeIds.set(store.normalizedName, saved.id);
           }
+          logPhase(`stores ${entry.parsed.stores.length}`);
 
           const { productIds, skuProductIds } =
             await this.resolveImportedProducts(
@@ -249,6 +267,7 @@ export class ExcelImportService {
               entry.parsed.products,
               storeIds,
             );
+          logPhase(`products ${entry.parsed.products.length}`);
 
           await this.createManyInChunks(
             tx.fulfillmentInvoice,
@@ -270,6 +289,7 @@ export class ExcelImportService {
             }),
             true,
           );
+          logPhase(`invoices ${entry.parsed.invoices.length}`);
 
           const orderRecords = entry.parsed.orders.map((order) => {
             const storeId = this.requireStoreId(storeIds, order.storeName);
@@ -298,6 +318,7 @@ export class ExcelImportService {
             })),
             true,
           );
+          logPhase(`orders ${orderRecords.length}`);
 
           const persistedOrderIds = new Set<string>();
           for (const chunk of this.chunk(
@@ -312,6 +333,7 @@ export class ExcelImportService {
               persistedOrderIds.add(row.id);
             }
           }
+          logPhase(`order lookup ${persistedOrderIds.size}`);
 
           const shipmentRows: Array<Record<string, unknown>> = [];
           const orderLineRows: Array<Record<string, unknown>> = [];
@@ -354,6 +376,9 @@ export class ExcelImportService {
 
           await this.createManyInChunks(tx.shipment, shipmentRows, true);
           await this.createManyInChunks(tx.orderLine, orderLineRows);
+          logPhase(
+            `shipments ${shipmentRows.length}, order lines ${orderLineRows.length}`,
+          );
 
           await this.createManyInChunks(
             tx.stockPurchase,
@@ -373,6 +398,7 @@ export class ExcelImportService {
               sourceRow: purchase.sourceRow,
             })),
           );
+          logPhase(`stock purchases ${entry.parsed.stockPurchases.length}`);
 
           await this.createManyInChunks(
             tx.inventoryMovement,
@@ -384,6 +410,7 @@ export class ExcelImportService {
               storeId: movement.storeName
                 ? this.lookupStoreId(storeIds, movement.storeName)
                 : undefined,
+              stockName: movement.stockName,
               movementDate: movement.movementDate,
               movementType: movement.movementType,
               quantity: movement.quantity,
@@ -393,6 +420,7 @@ export class ExcelImportService {
               sourceRow: movement.sourceRow,
             })),
           );
+          logPhase(`inventory movements ${entry.parsed.inventoryMovements.length}`);
 
           await this.persistInventoryProductMatches(
             tx,
@@ -400,6 +428,7 @@ export class ExcelImportService {
             entry.parsed.inventoryMovements,
             productIds,
           );
+          logPhase('inventory product matches');
 
           await this.createManyInChunks(
             tx.walletTransaction,
@@ -418,6 +447,7 @@ export class ExcelImportService {
               sourceRow: transaction.sourceRow,
             })),
           );
+          logPhase(`wallet transactions ${entry.parsed.walletTransactions.length}`);
 
           await this.createManyInChunks(
             tx.anomaly,
@@ -431,6 +461,7 @@ export class ExcelImportService {
                 sourceRow: warning.sourceRow,
               })),
           );
+          logPhase(`anomalies ${entry.parsed.warnings.length}`);
 
           return { importBatchId: batch.id, summary: entry.preview };
         },
@@ -474,22 +505,21 @@ export class ExcelImportService {
 
       const result = await this.prisma.$transaction(
         async (tx) => {
-          const orderIds = (
-            await tx.order.findMany({
-              where: { importBatchId },
-              select: { id: true },
-            })
-          ).map((order) => order.id);
+          // Raise the per-statement timeout for this transaction: Supabase's
+          // pooled connections apply a default statement_timeout that can be
+          // shorter than the interactive-transaction timeout below, which
+          // would abort a large cascade delete partway through.
+          await tx.$executeRawUnsafe('SET LOCAL statement_timeout = 280000');
 
-          if (orderIds.length > 0) {
-            await tx.shipment.deleteMany({
-              where: { orderId: { in: orderIds } },
-            });
-            await tx.orderLine.deleteMany({
-              where: { orderId: { in: orderIds } },
-            });
-          }
-
+          // excel_order_lines.orderId and excel_shipments.orderId both have
+          // ON DELETE CASCADE back to excel_orders, so deleting orders by
+          // importBatchId below removes them too. Do NOT also delete them
+          // here by collecting every order id into an IN (...) list first —
+          // for a batch with thousands of orders that single statement is
+          // what was timing out (canceling statement due to statement
+          // timeout, Postgres error 57014), since deleting by importBatchId
+          // is a plain indexed-equality filter instead of a huge parameter
+          // list.
           const inventoryItemIds = (
             await tx.inventoryItem.findMany({
               where: { importBatchId },
@@ -750,17 +780,30 @@ export class ExcelImportService {
         const nameMatch = productsByName.get(normalizedName);
         if (nameMatch && nameMatch.id !== existingAlias.productId) {
           await this.mergeProduct(tx, existingAlias.productId, nameMatch.id);
-          saved = await this.updateProductMetadata(tx, nameMatch.id, product);
+          saved = await this.updateProductMetadata(
+            tx,
+            nameMatch.id,
+            product,
+            false,
+            nameMatch.quotation,
+          );
         } else {
           saved = await this.updateProductMetadata(
             tx,
             existingAlias.productId,
             product,
             true,
+            existingAlias.product.quotation,
           );
         }
       } else if (saved) {
-        saved = await this.updateProductMetadata(tx, saved.id, product);
+        saved = await this.updateProductMetadata(
+          tx,
+          saved.id,
+          product,
+          false,
+          saved.quotation,
+        );
       } else {
         saved = await tx.product.create({
           data: {
@@ -838,6 +881,7 @@ export class ExcelImportService {
     productId: string,
     product: ParsedProduct,
     updateName = false,
+    existingQuotation?: ParsedProduct['quotation'],
   ) {
     const data: Record<string, unknown> = {};
     if (updateName) data.name = product.name;
@@ -847,13 +891,9 @@ export class ExcelImportService {
       // A product with several SKU aliases is saved once per alias; merge
       // with the stored quotation so a later alias with partial data does
       // not wipe rows contributed by earlier ones.
-      const existing = await tx.product.findUnique({
-        where: { id: productId },
-        select: { quotation: true },
-      });
       data.quotation =
         mergeProductQuotation(
-          (existing?.quotation ?? undefined) as ParsedProduct['quotation'],
+          existingQuotation,
           product.quotation,
         ) ?? product.quotation;
     }
@@ -991,6 +1031,7 @@ export class ExcelImportService {
       string,
       {
         stockName: string;
+        stockSku?: string;
         normalizedName: string;
         sourceSheet?: string;
         productName?: string;
@@ -1010,6 +1051,7 @@ export class ExcelImportService {
       }
       stockItems.set(normalizedName, {
         stockName,
+        stockSku: cleanText(movement.stockSku) || undefined,
         normalizedName,
         sourceSheet: movement.sourceSheet,
         productName: movement.productName,
@@ -1057,11 +1099,13 @@ export class ExcelImportService {
         },
         update: {
           stockName: item.stockName,
+          stockSku: item.stockSku,
           sourceSheet: item.sourceSheet,
         },
         create: {
           importBatchId,
           stockName: item.stockName,
+          stockSku: item.stockSku,
           normalizedName: item.normalizedName,
           sourceSheet: item.sourceSheet,
         },
@@ -1745,6 +1789,22 @@ export class ExcelImportService {
         }
 
         const lineType = classifyOrderLine(this.rowText(dataRow), totalCost);
+        const componentTotal = roundMoney(
+          productCost + shippingCost + handlingCost,
+        );
+        if (
+          lineType === 'product' &&
+          Math.abs(componentTotal - totalCost) > 0.05
+        ) {
+          parsed.warnings.push({
+            sourceSheet: sheet.name,
+            sourceRow: dataRow.rowNumber,
+            severity: 'warning',
+            message: `Order ${orderNumber} line total mismatch: components ${componentTotal.toFixed(
+              2,
+            )}, total cost ${totalCost.toFixed(2)}.`,
+          });
+        }
         const orderKey = `${orderNumber}|${invoiceReference}`;
         const order =
           orders.get(orderKey) ??
@@ -1926,6 +1986,8 @@ export class ExcelImportService {
   ) {
     const productByColumn = new Map<number, StockProductMatch>();
     const headerRow = sheet.rows[0];
+    const labelRowIndex = this.findStockListLabelRowIndex(sheet.rows);
+    const labelRow = sheet.rows[labelRowIndex];
 
     if (headerRow) {
       for (const [column, value] of Object.entries(headerRow.cells)) {
@@ -1933,11 +1995,24 @@ export class ExcelImportService {
         const productName =
           cleanQuotationProductName(rawProductName).name || rawProductName;
         if (productName && isUsefulQuotationProductName(productName)) {
-          const match = this.matchStockProduct(parsed.products, productName);
-          productByColumn.set(Number(column), match);
+          const headerColumn = Number(column);
+          const stockSku = this.findStockSkuForHeader(
+            sheet.rows,
+            headerColumn,
+            labelRowIndex,
+          );
+          const dateColumn = this.findStockDateColumn(labelRow, headerColumn);
+          const match = this.matchStockProduct(
+            parsed.products,
+            productName,
+            stockSku,
+          );
+          match.dateColumn = dateColumn;
+          productByColumn.set(headerColumn, match);
           if (match.productName) {
             this.addProduct(parsed, productKeys, {
               name: match.productName,
+              sku: stockSku,
               source: 'stock_header',
             });
           }
@@ -1962,10 +2037,8 @@ export class ExcelImportService {
 
     const usedCommentCells = new Set<string>();
 
-    for (const row of sheet.rows.slice(2)) {
+    for (const row of sheet.rows.slice(labelRowIndex + 1)) {
       for (const [columnText, value] of Object.entries(row.cells)) {
-        const quantity = toNumber(value);
-        if (quantity === null || quantity === 0) continue;
         const column = Number(columnText);
         const productColumn = this.findProductForStockColumn(
           productByColumn,
@@ -1973,25 +2046,34 @@ export class ExcelImportService {
         );
         if (!productColumn) continue;
 
-        const label = normalizeText(sheet.rows[1]?.cells[column]);
-        if (!['stock', 'used'].includes(label)) continue;
+        const label = normalizeText(labelRow?.cells[column]);
+        if (!['stock', 'used', 'left'].includes(label)) continue;
+
+        const quantity = toNumber(value);
+        if (quantity === null || (quantity === 0 && label !== 'left')) continue;
 
         const cellRef = `${numberToColumn(column)}${row.rowNumber}`;
         const comment = sheet.comments[cellRef];
         if (comment) {
           usedCommentCells.add(cellRef);
         }
-        const movementType = comment?.toLowerCase().includes('return')
-          ? 'return_to_stock'
-          : label === 'used'
-            ? 'consumption'
-            : 'inbound';
+        const movementType =
+          label === 'left'
+            ? 'snapshot'
+            : label === 'used'
+              ? 'consumption'
+              : comment?.toLowerCase().includes('return')
+                ? 'return_to_stock'
+                : 'inbound';
 
         parsed.inventoryMovements.push({
           stockName: productColumn.stockName,
+          stockSku: productColumn.stockSku,
           productName: productColumn.productName,
           movementDate:
-            parseDateLike(row.cells[productColumn.headerColumn - 1]) ??
+            parseDateLike(
+              row.cells[productColumn.dateColumn ?? productColumn.headerColumn - 1],
+            ) ??
             undefined,
           movementType,
           quantity,
@@ -2033,6 +2115,7 @@ export class ExcelImportService {
 
       parsed.inventoryMovements.push({
         stockName: productColumn?.stockName ?? productName,
+        stockSku: productColumn?.stockSku,
         productName,
         movementDate: parseDateLike(comment) ?? undefined,
         movementType,
@@ -2110,10 +2193,11 @@ export class ExcelImportService {
       const transactionStoreName =
         storeName && !this.isBrandOwnerName(storeName) ? storeName : undefined;
 
-      if (depositAmount !== null) {
+      const depositDate = parseDateLike(row.cells[1]) ?? undefined;
+      if (depositAmount !== null && depositDate) {
         parsed.walletTransactions.push({
           storeName: transactionStoreName,
-          transactionDate: parseDateLike(row.cells[1]) ?? undefined,
+          transactionDate: depositDate,
           transactionType: 'deposit',
           invoiceReference,
           amount: depositAmount,
@@ -2121,6 +2205,13 @@ export class ExcelImportService {
           exchangeRate,
           sourceSheet: sheet.name,
           sourceRow: row.rowNumber,
+        });
+      } else if (depositAmount !== null) {
+        parsed.warnings.push({
+          sourceSheet: sheet.name,
+          sourceRow: row.rowNumber,
+          severity: 'info',
+          message: `Numeric amount without a deposit date skipped: ${depositAmount}`,
         });
       }
 
@@ -2169,7 +2260,7 @@ export class ExcelImportService {
         sourceRow: 1,
         severity: 'warning',
         message:
-          'This exact Excel file was already imported. Re-import is blocked to prevent duplicate data.',
+          'This exact Excel file was already imported. Confirming will ignore it and no data will be added.',
       });
       return duplicates;
     }
@@ -2266,6 +2357,20 @@ export class ExcelImportService {
     const outputDir = resolve(process.cwd(), 'local-imports');
     await mkdir(outputDir, { recursive: true });
     const outputPath = resolve(outputDir, `${parsed.fileHash}.json.gz`);
+    const alreadyExists = await access(outputPath)
+      .then(() => true)
+      .catch(() => false);
+
+    if (alreadyExists) {
+      return {
+        importBatchId: parsed.fileHash,
+        storage: 'local',
+        summary: preview,
+        ignored: true,
+        message: `An identical copy of ${parsed.fileName} was already imported. No data was added.`,
+      };
+    }
+
     const payload = JSON.stringify({
       importedAt: new Date().toISOString(),
       parsed,
@@ -2548,7 +2653,23 @@ export class ExcelImportService {
   private matchStockProduct(
     products: ParsedProduct[],
     stockName: string,
+    stockSku?: string,
   ): StockProductMatch {
+    const sku = cleanText(stockSku);
+    if (sku) {
+      const skuMatch = products.find((product) => product.sku === sku);
+      if (skuMatch) {
+        return {
+          stockName,
+          stockSku: sku,
+          productName: skuMatch.name,
+          relationType: 'alias',
+          quantityPerProduct: 1,
+          confidence: 0.99,
+        };
+      }
+    }
+
     const known = knownStockLinks.find(
       (item) =>
         normalizeInventoryName(item.stockName) ===
@@ -2567,6 +2688,7 @@ export class ExcelImportService {
       const product = findKnownProduct(known.productName);
       return {
         stockName,
+        stockSku: sku || undefined,
         productName: product?.name ?? known.productName,
         relationType: known.relationType,
         quantityPerProduct: known.quantityPerProduct ?? 1,
@@ -2581,6 +2703,7 @@ export class ExcelImportService {
     if (exact) {
       return {
         stockName,
+        stockSku: sku || undefined,
         productName: exact.name,
         relationType: 'alias',
         quantityPerProduct: 1,
@@ -2592,6 +2715,7 @@ export class ExcelImportService {
     if (component) {
       return {
         stockName,
+        stockSku: sku || undefined,
         productName: component.name,
         relationType: 'component',
         quantityPerProduct: inferQuantityPerProduct(stockName, component.name),
@@ -2603,6 +2727,7 @@ export class ExcelImportService {
     if (fuzzy) {
       return {
         stockName,
+        stockSku: sku || undefined,
         productName: fuzzy.name,
         relationType: 'variant',
         quantityPerProduct: 1,
@@ -2612,6 +2737,7 @@ export class ExcelImportService {
 
     return {
       stockName,
+      stockSku: sku || undefined,
       relationType: 'alias',
       quantityPerProduct: 1,
       confidence: 0,
@@ -2656,6 +2782,52 @@ export class ExcelImportService {
       .sort(([left], [right]) => right - left)[0];
 
     return match ? { headerColumn: match[0], ...match[1] } : undefined;
+  }
+
+  private findStockListLabelRowIndex(rows: WorkbookRow[]) {
+    let bestIndex = 1;
+    let bestScore = 0;
+
+    for (let index = 1; index < Math.min(rows.length, 5); index += 1) {
+      const score = Object.values(rows[index]?.cells ?? {}).filter((value) => {
+        const label = normalizeText(value);
+        return label === 'stock' || label === 'used' || label === 'left';
+      }).length;
+
+      if (score > bestScore) {
+        bestIndex = index;
+        bestScore = score;
+      }
+    }
+
+    return bestIndex;
+  }
+
+  private findStockSkuForHeader(
+    rows: WorkbookRow[],
+    headerColumn: number,
+    labelRowIndex: number,
+  ) {
+    for (let index = 1; index < labelRowIndex; index += 1) {
+      const sku = cleanText(rows[index]?.cells[headerColumn]);
+      if (sku) return sku;
+    }
+
+    return undefined;
+  }
+
+  private findStockDateColumn(
+    labelRow: WorkbookRow | undefined,
+    headerColumn: number,
+  ) {
+    for (let column = headerColumn; column <= headerColumn + 6; column += 1) {
+      const label = normalizeText(labelRow?.cells[column]);
+      if (label === 'stock' || label === 'used') {
+        return column - 1;
+      }
+    }
+
+    return headerColumn - 1;
   }
 
   private lookupStoreId(storeIds: Map<string, string>, storeName: string) {
@@ -3292,11 +3464,22 @@ function parseDateLike(value: unknown): Date | undefined {
 }
 
 function formatInvoiceReference(value: string) {
+  const normalized = cleanText(value);
+  const writtenDate = normalized.match(
+    /^(20\d{2})[-/](\d{1,2})[-/](\d{1,2})(.*)$/,
+  );
+  if (writtenDate) {
+    const [, year, month, day, suffix] = writtenDate;
+    return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}${suffix}`;
+  }
+
   const numeric = toNumber(value);
-  if (numeric === null || numeric < 40000 || numeric > 60000) return value;
+  if (numeric === null || numeric < 40000 || numeric > 60000) {
+    return normalized;
+  }
 
   const date = parseDateLike(value);
-  return date ? date.toISOString().slice(0, 10) : value;
+  return date ? date.toISOString().slice(0, 10) : normalized;
 }
 
 function parseInvoiceDate(row: WorkbookRow | undefined): Date | undefined {
@@ -3327,11 +3510,7 @@ function sum<T extends Record<K, number>, K extends keyof T>(
 
 function sumLineTotals(lines: ParsedOrderLine[]) {
   return roundMoney(
-    lines.reduce(
-      (total, line) =>
-        total + line.productCost + line.shippingCost + line.handlingCost,
-      0,
-    ),
+    lines.reduce((total, line) => total + line.totalCost, 0),
   );
 }
 
@@ -3341,7 +3520,9 @@ function roundMoney(value: number) {
 
 function classifyOrderLine(rowText: string, totalCost: number) {
   if (rowText.includes('refund') || totalCost < 0) return 'refund';
-  if (rowText.match(/correction|adjust|modify|difference/)) return 'adjustment';
+  if (rowText.match(/correction|adjust|modify|difference|redeliver/)) {
+    return 'adjustment';
+  }
   return 'product';
 }
 

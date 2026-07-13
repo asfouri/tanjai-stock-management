@@ -184,6 +184,7 @@ create table if not exists public.excel_inventory_movements (
   "importBatchId" text not null references public.excel_import_batches(id),
   "productId" text references public.excel_products(id),
   "storeId" text references public.excel_stores(id),
+  "stockName" text,
   "movementDate" timestamptz,
   "movementType" text not null,
   quantity double precision not null,
@@ -194,18 +195,25 @@ create table if not exists public.excel_inventory_movements (
   "createdAt" timestamptz not null default now()
 );
 
+alter table public.excel_inventory_movements
+  add column if not exists "stockName" text;
+
 create index if not exists excel_inventory_movements_movement_type_idx
   on public.excel_inventory_movements ("movementType");
 
 create table if not exists public.excel_inventory_items (
   id text primary key default gen_random_uuid()::text,
   "stockName" text not null,
+  "stockSku" text,
   "normalizedName" text not null,
   "sourceSheet" text,
   "importBatchId" text not null references public.excel_import_batches(id),
   "createdAt" timestamptz not null default now(),
   "updatedAt" timestamptz not null default now()
 );
+
+alter table public.excel_inventory_items
+  add column if not exists "stockSku" text;
 
 create unique index if not exists excel_inventory_items_import_normalized_key
   on public.excel_inventory_items ("importBatchId", "normalizedName");
@@ -253,6 +261,37 @@ create index if not exists excel_wallet_transactions_transaction_date_idx
 
 alter table public.excel_wallet_transactions
   add column if not exists "exchangeRate" double precision;
+
+create table if not exists public.deposit_requests (
+  id text primary key default gen_random_uuid()::text,
+  "requestedByUserId" text,
+  "requestedByEmail" text not null,
+  "transactionDate" timestamptz not null,
+  amount double precision not null check (amount > 0),
+  "proofFileName" text not null,
+  "proofMimeType" text not null,
+  "proofData" bytea not null,
+  status text not null default 'PENDING'
+    check (status in ('PENDING', 'APPROVED', 'REJECTED')),
+  "reviewedByUserId" text,
+  "reviewedByEmail" text,
+  "reviewedAt" timestamptz,
+  "rejectionReason" text,
+  "createdAt" timestamptz not null default now(),
+  "updatedAt" timestamptz not null default now()
+);
+
+create index if not exists deposit_requests_requested_by_user_idx
+  on public.deposit_requests ("requestedByUserId");
+
+create index if not exists deposit_requests_requested_by_email_idx
+  on public.deposit_requests ("requestedByEmail");
+
+create index if not exists deposit_requests_status_idx
+  on public.deposit_requests (status);
+
+create index if not exists deposit_requests_transaction_date_idx
+  on public.deposit_requests ("transactionDate");
 
 create table if not exists public.excel_anomalies (
   id text primary key default gen_random_uuid()::text,

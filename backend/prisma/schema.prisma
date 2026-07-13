@@ -5,7 +5,7 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
-  schemas  = ["public"]
+  schemas = ["public", "auth"]
 }
 
 model ImportBatch {
@@ -232,6 +232,7 @@ model InventoryMovement {
   importBatchId String
   productId     String?
   storeId       String?
+  stockName     String?
   movementDate  DateTime?
   movementType  String
   quantity      Float
@@ -253,6 +254,7 @@ model InventoryMovement {
 model InventoryItem {
   id             String   @id @default(uuid())
   stockName      String
+  stockSku       String?
   normalizedName String
   sourceSheet    String?
   importBatchId  String
@@ -308,6 +310,31 @@ model WalletTransaction {
   @@index([invoiceReference])
   @@index([transactionDate])
   @@map("excel_wallet_transactions")
+  @@schema("public")
+}
+
+model DepositRequest {
+  id                 String   @id @default(uuid())
+  requestedByUserId  String?
+  requestedByEmail   String
+  transactionDate    DateTime
+  amount             Float
+  proofFileName      String
+  proofMimeType      String
+  proofData           Bytes
+  status              String   @default("PENDING")
+  reviewedByUserId   String?
+  reviewedByEmail    String?
+  reviewedAt          DateTime?
+  rejectionReason    String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([requestedByUserId])
+  @@index([requestedByEmail])
+  @@index([status])
+  @@index([transactionDate])
+  @@map("deposit_requests")
   @@schema("public")
 }
 

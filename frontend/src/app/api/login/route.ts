@@ -44,9 +44,58 @@ export async function POST(request: Request) {
     return loginRedirect("Enter both email and password.");
   }
 
+  let supabaseMessage = "";
+
+  if (supabaseUrl && supabaseAnonKey) {
+    const supabaseController = new AbortController();
+    const supabaseTimeoutId = setTimeout(
+      () => supabaseController.abort(),
+      8000,
+    );
+    const response = await fetch(
+      `${supabaseUrl.replace(/\/$/, "")}/auth/v1/token?grant_type=password`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: supabaseAnonKey,
+          Authorization: `Bearer ${supabaseAnonKey}`,
+        },
+        body: JSON.stringify({ email, password }),
+        signal: supabaseController.signal,
+      },
+    ).catch((error: unknown) => {
+      const message =
+        error instanceof Error && error.name === "AbortError"
+          ? "Auth request timed out. Try again."
+          : "Unable to reach auth service.";
+      return new Response(JSON.stringify({ error_description: message }), {
+        status: 504,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    clearTimeout(supabaseTimeoutId);
+
+    const body = (await response.json().catch(() => null)) as
+      | SupabasePasswordResponse
+      | null;
+    if (response.ok && body?.access_token) {
+      const redirect = relativeRedirect("/dashboard");
+      redirect.cookies.set("tanjai_access_token", body.access_token, {
+        httpOnly: true,
+        maxAge: body.expires_in ?? 3600,
+        path: "/",
+        sameSite: "lax",
+        secure: isSecureRequest(request),
+      });
+      return redirect;
+    }
+    supabaseMessage =
+      body?.error_description || body?.msg || body?.error || "Unable to sign in.";
+  }
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 8000);
-
   const backendResponse = await fetch(`${backendBaseUrl}/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -67,7 +116,6 @@ export async function POST(request: Request) {
   const backendBody = (await backendResponse.json().catch(() => null)) as
     | { accessToken?: string; expiresIn?: number; message?: string }
     | null;
-
   if (backendResponse.ok && backendBody?.accessToken) {
     const redirect = relativeRedirect("/dashboard");
     redirect.cookies.set("tanjai_access_token", backendBody.accessToken, {
@@ -77,59 +125,10 @@ export async function POST(request: Request) {
       sameSite: "lax",
       secure: isSecureRequest(request),
     });
-
     return redirect;
   }
 
-  if (!supabaseUrl || !supabaseAnonKey) {
-    return loginRedirect(backendBody?.message || "Auth is not configured.");
-  }
-
-  const supabaseController = new AbortController();
-  const supabaseTimeoutId = setTimeout(() => supabaseController.abort(), 8000);
-
-  const response = await fetch(
-    `${supabaseUrl.replace(/\/$/, "")}/auth/v1/token?grant_type=password`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: supabaseAnonKey,
-        Authorization: `Bearer ${supabaseAnonKey}`,
-      },
-      body: JSON.stringify({ email, password }),
-      signal: supabaseController.signal,
-    }
-  ).catch((error: unknown) => {
-    const message =
-      error instanceof Error && error.name === "AbortError"
-        ? "Auth request timed out. Try again."
-        : "Unable to reach auth service.";
-    return new Response(JSON.stringify({ error_description: message }), {
-      status: 504,
-      headers: { "Content-Type": "application/json" },
-    });
-  });
-  clearTimeout(supabaseTimeoutId);
-
-  const body = (await response.json().catch(() => null)) as
-    | SupabasePasswordResponse
-    | null;
-
-  if (!response.ok || !body?.access_token) {
-    return loginRedirect(
-      body?.error_description || body?.msg || body?.error || "Unable to sign in."
-    );
-  }
-
-  const redirect = relativeRedirect("/dashboard");
-  redirect.cookies.set("tanjai_access_token", body.access_token, {
-    httpOnly: true,
-    maxAge: body.expires_in ?? 3600,
-    path: "/",
-    sameSite: "lax",
-    secure: isSecureRequest(request),
-  });
-
-  return redirect;
+  return loginRedirect(
+    supabaseMessage || backendBody?.message || "Unable to sign in.",
+  );
 }

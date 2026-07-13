@@ -1,12 +1,19 @@
-import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  InternalServerErrorException,
+  NotFoundException,
+} from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import {
   ChartPoint,
   DashboardDebugCounts,
   DashboardFilters,
+  NotificationItem,
   DashboardSection,
   DashboardSummary,
 } from './app.types';
+import type { AuthenticatedUser } from './auth/supabase-auth.guard';
 import { PrismaService } from './prisma.service';
 
 @Injectable()
@@ -17,25 +24,272 @@ export class AppService {
     return 'Hello World!';
   }
 
+  async getNotifications(
+    access: AuthenticatedUser,
+  ): Promise<NotificationItem[]> {
+    const storeIds = this.accessStoreIds(access);
+    const orderWhere = storeIds ? { storeId: { in: storeIds } } : undefined;
+    const isAdmin = access.role === 'TANJAI_ADMIN';
+    const isBrandOwner = access.role === 'BRAND_OWNER';
+
+    const [orders, depositRequests, imports, anomalies, stockMovements] =
+      await Promise.all([
+      this.prisma.order.findMany({
+        where: orderWhere,
+        select: {
+          id: true,
+          externalOrderNumber: true,
+          createdAt: true,
+          store: { select: { name: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+      }),
+      isAdmin || isBrandOwner
+        ? this.prisma.depositRequest.findMany({
+            where: isBrandOwner
+              ? {
+                  OR: [
+                    ...(access.id
+                      ? [{ requestedByUserId: access.id }]
+                      : []),
+                    { requestedByEmail: access.email },
+                  ],
+                }
+              : { status: 'PENDING' },
+            select: {
+              id: true,
+              requestedByEmail: true,
+              amount: true,
+              status: true,
+              createdAt: true,
+              updatedAt: true,
+            },
+            orderBy: { updatedAt: 'desc' },
+            take: 10,
+          })
+        : Promise.resolve([]),
+      isAdmin
+        ? this.prisma.importBatch.findMany({
+            select: { id: true, fileName: true, status: true, createdAt: true },
+            orderBy: { createdAt: 'desc' },
+            take: 5,
+          })
+        : Promise.resolve([]),
+      isAdmin
+        ? this.prisma.anomaly.findMany({
+            select: { id: true, message: true, severity: true, createdAt: true },
+            orderBy: { createdAt: 'desc' },
+            take: 5,
+          })
+        : Promise.resolve([]),
+      this.prisma.inventoryMovement.findMany({
+        where: storeIds ? { storeId: { in: storeIds } } : undefined,
+        select: {
+          quantity: true,
+          movementType: true,
+          stockName: true,
+          movementDate: true,
+          createdAt: true,
+          product: { select: { name: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 25000,
+      }),
+    ]);
+
+    const stockTotals = new Map<
+      string,
+      { total: number; updatedAt: Date }
+    >();
+    for (const movement of stockMovements) {
+      const label = movement.product?.name ?? movement.stockName?.trim();
+      if (!label) continue;
+      const sign = this.inventoryMovementSign(movement.movementType);
+      if (sign === 0) continue;
+      const movementTime = movement.movementDate ?? movement.createdAt;
+      const current = stockTotals.get(label);
+      stockTotals.set(label, {
+        total: (current?.total ?? 0) + movement.quantity * sign,
+        updatedAt:
+          current && current.updatedAt > movementTime
+            ? current.updatedAt
+            : movementTime,
+      });
+    }
+
+    const stockAlerts: NotificationItem[] = [...stockTotals.entries()]
+      .filter(([, stock]) => stock.total <= 10)
+      .sort((left, right) => left[1].total - right[1].total)
+      .slice(0, 10)
+      .map(([productName, stock]) => ({
+        id: `stock-${productName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+        type: 'STOCK',
+        priority: 'HIGH',
+        title: stock.total <= 0 ? 'Product out of stock' : 'Stock running low',
+        message:
+          stock.total <= 0
+            ? `${productName} has no stock remaining.`
+            : `${productName} has only ${this.round(stock.total)} units remaining.`,
+        createdAt: stock.updatedAt.toISOString(),
+        section: 'products',
+      }));
+
+    const paymentAlerts: NotificationItem[] = [];
+    if (isAdmin) {
+      const [importedDeposits, approvedDeposits, spent, latestTransaction] =
+        await Promise.all([
+          this.prisma.walletTransaction.aggregate({
+            where: {
+              transactionType: { contains: 'deposit', mode: 'insensitive' },
+            },
+            _sum: { amount: true },
+          }),
+          this.prisma.depositRequest.aggregate({
+            where: { status: 'APPROVED' },
+            _sum: { amount: true },
+          }),
+          this.prisma.walletTransaction.aggregate({
+            where: {
+              transactionType: {
+                in: ['store_invoice', 'stock_purchase', 'tax'],
+                mode: 'insensitive',
+              },
+            },
+            _sum: { amount: true },
+          }),
+          this.prisma.walletTransaction.findFirst({
+            select: { createdAt: true },
+            orderBy: { createdAt: 'desc' },
+          }),
+        ]);
+      const totalDeposits = this.round(
+        (importedDeposits._sum.amount ?? 0) +
+          (approvedDeposits._sum.amount ?? 0),
+      );
+      const totalSpent = this.round(Math.abs(spent._sum.amount ?? 0));
+      const remaining = this.round(totalDeposits - totalSpent);
+      const remainingRatio = totalDeposits > 0 ? remaining / totalDeposits : 0;
+
+      if (remaining <= 0) {
+        paymentAlerts.push({
+          id: 'payment-balance-exhausted',
+          type: 'PAYMENT',
+          priority: 'HIGH',
+          title: 'Deposit balance exhausted',
+          message: `Spending has consumed the available deposits. Balance: ${remaining.toLocaleString('en-US', { style: 'currency', currency: 'USD' })}.`,
+          createdAt: (latestTransaction?.createdAt ?? new Date(0)).toISOString(),
+          section: 'payments',
+        });
+      } else if (remainingRatio <= 0.1) {
+        paymentAlerts.push({
+          id: 'payment-balance-low',
+          type: 'PAYMENT',
+          priority: 'MEDIUM',
+          title: 'Deposit balance running low',
+          message: `Only ${remaining.toLocaleString('en-US', { style: 'currency', currency: 'USD' })} remains from deposits.`,
+          createdAt: (latestTransaction?.createdAt ?? new Date(0)).toISOString(),
+          section: 'payments',
+        });
+      }
+    }
+
+    const notifications: NotificationItem[] = [
+      ...orders.map((order) => ({
+        id: `order-${order.id}`,
+        type: 'ORDER' as const,
+        priority: 'LOW' as const,
+        title: `Order ${order.externalOrderNumber}`,
+        message: `New order activity for ${order.store.name}.`,
+        createdAt: order.createdAt.toISOString(),
+        section: 'orders' as const,
+      })),
+      ...depositRequests.map((request) => ({
+        id: `deposit-${request.id}-${request.status}`,
+        type: 'DEPOSIT' as const,
+        priority: (request.status === 'REJECTED'
+          ? 'HIGH'
+          : request.status === 'PENDING'
+            ? 'MEDIUM'
+            : 'LOW') as NotificationItem['priority'],
+        title: isAdmin
+          ? `Deposit request from ${request.requestedByEmail}`
+          : `Deposit request ${this.formatLabel(request.status)}`,
+        message: `${request.amount.toLocaleString('en-US', {
+          style: 'currency',
+          currency: 'USD',
+        })}${isAdmin ? ' is waiting for review.' : ` is ${request.status.toLowerCase()}.`}`,
+        createdAt: (request.updatedAt ?? request.createdAt).toISOString(),
+        section: 'payments' as const,
+      })),
+      ...imports.map((batch) => ({
+        id: `import-${batch.id}`,
+        type: 'IMPORT' as const,
+        priority: 'LOW' as const,
+        title: 'Excel import completed',
+        message: `${batch.fileName} was imported successfully.`,
+        createdAt: batch.createdAt.toISOString(),
+        section: 'imports' as const,
+      })),
+      ...anomalies.map((anomaly) => ({
+        id: `anomaly-${anomaly.id}`,
+        type: 'ANOMALY' as const,
+        priority: (['critical', 'error'].includes(
+          anomaly.severity.toLowerCase(),
+        )
+          ? 'HIGH'
+          : anomaly.severity.toLowerCase() === 'warning'
+            ? 'MEDIUM'
+            : 'LOW') as NotificationItem['priority'],
+        title: `${this.formatLabel(anomaly.severity)} anomaly`,
+        message: anomaly.message,
+        createdAt: anomaly.createdAt.toISOString(),
+        section: 'dashboard' as const,
+      })),
+      ...stockAlerts,
+      ...paymentAlerts,
+    ];
+
+    const priorityOrder: Record<NotificationItem['priority'], number> = {
+      HIGH: 0,
+      MEDIUM: 1,
+      LOW: 2,
+    };
+    return notifications
+      .sort(
+        (first, second) =>
+          priorityOrder[first.priority] - priorityOrder[second.priority] ||
+          new Date(second.createdAt).getTime() -
+            new Date(first.createdAt).getTime(),
+      )
+      .slice(0, 40);
+  }
+
   async getDashboardSection(
     section: string,
     filters: DashboardFilters = {},
+    access: AuthenticatedUser,
   ): Promise<DashboardSection> {
     const normalizedFilters = this.normalizeDashboardFilters(filters);
+    const storeIds = this.accessStoreIds(access);
 
     switch (section) {
       case 'products':
-        return this.getProductsSection();
+        return this.getProductsSection('with-skus', storeIds, access.role);
+      case 'products-without-skus':
+        return this.getProductsSection('without-skus', storeIds, access.role);
       case 'orders':
-        return this.getOrdersSection(normalizedFilters);
-      case 'product-matching':
-        return this.getProductMatchingSection();
+        return this.getOrdersSection(normalizedFilters, storeIds, access.role);
       case 'stores':
-        return this.getStoresSection();
+        return this.getStoresSection(storeIds);
       case 'invoices':
-        return this.getInvoicesSection();
+        return this.getInvoicesSection(
+          normalizedFilters,
+          storeIds,
+          access.role,
+        );
       case 'payments':
-        return this.getPaymentsSection();
+        return this.getPaymentsSection(normalizedFilters, access);
       default:
         return { title: 'Dashboard', columns: [], rows: [] };
     }
@@ -43,13 +297,15 @@ export class AppService {
 
   async getDashboardSummary(
     filters: DashboardFilters = {},
+    access: AuthenticatedUser,
   ): Promise<DashboardSummary> {
     const normalizedFilters = this.normalizeDashboardFilters(filters);
-    return this.getErpDashboardSummary(normalizedFilters);
+    return this.getErpDashboardSummary(normalizedFilters, access);
   }
 
   private async getErpDashboardSummary(
     filters: DashboardFilters,
+    access: AuthenticatedUser,
   ): Promise<DashboardSummary> {
     try {
       const debugCounts = await this.getDashboardDebugCounts();
@@ -72,8 +328,14 @@ export class AppService {
               .map((brand) => brand.id),
           )
         : null;
-      const restrictStores = Boolean(filters.store || filters.brand);
+      const accessStoreIds = this.accessStoreIds(access);
+      const restrictStores = Boolean(
+        filters.store || filters.brand || accessStoreIds,
+      );
       const allowedStores = stores.filter((store) => {
+        if (accessStoreIds && !accessStoreIds.includes(store.id)) {
+          return false;
+        }
         if (
           filters.store &&
           !sameText(store.name, filters.store) &&
@@ -189,7 +451,9 @@ export class AppService {
         totalShipments,
         costAgg,
         invoiceAgg,
-        latestWithBalance,
+        allDepositTotals,
+        allSpendTotals,
+        approvedDepositTotals,
       ] = await Promise.all([
         this.prisma.order.count({ where: orderWhere }),
         this.prisma.fulfillmentInvoice.count({ where: invoiceWhere }),
@@ -223,12 +487,22 @@ export class AppService {
           },
           take: dashboardRowLimit,
         }),
-        this.prisma.anomaly.findMany({
-          select: { id: true, severity: true, createdAt: true, message: true },
-          orderBy: { createdAt: 'desc' },
-          take: 1000,
-        }),
+        access.role === 'BRAND_OWNER'
+          ? Promise.resolve([])
+          : this.prisma.anomaly.findMany({
+              select: {
+                id: true,
+                severity: true,
+                createdAt: true,
+                message: true,
+              },
+              orderBy: { createdAt: 'desc' },
+              take: 1000,
+            }),
         this.prisma.productSkuAlias.findMany({
+          where: accessStoreIds
+            ? { storeId: { in: accessStoreIds } }
+            : undefined,
           select: { sku: true },
           orderBy: { sku: 'asc' },
           take: 500,
@@ -266,13 +540,48 @@ export class AppService {
           where: invoiceWhere,
           _sum: { total: true, refunds: true, otherCost: true },
         }),
-        this.prisma.walletTransaction.findFirst({
+        this.prisma.walletTransaction.aggregate({
           where: {
-            ...walletWhereEarly,
-            runningBalance: { not: null },
+            ...(access.role === 'TANJAI_ADMIN'
+              ? {
+                  transactionType: {
+                    contains: 'deposit',
+                    mode: 'insensitive' as const,
+                  },
+                }
+              : { id: '__not_visible__' }),
           },
-          orderBy: { transactionDate: 'desc' },
-          select: { runningBalance: true },
+          _sum: { amount: true },
+        }),
+        this.prisma.walletTransaction.aggregate({
+          where: {
+            transactionType: {
+              in: ['store_invoice', 'stock_purchase', 'tax'],
+              mode: 'insensitive',
+            },
+            ...(accessStoreIds
+              ? { storeId: { in: accessStoreIds } }
+              : {}),
+          },
+          _sum: { amount: true },
+        }),
+        this.prisma.depositRequest.aggregate({
+          where: {
+            status: 'APPROVED',
+            ...(access.role === 'UFULFILL'
+              ? { id: '__not_visible__' }
+              : access.role === 'BRAND_OWNER'
+                ? {
+                    OR: [
+                      ...(access.id
+                        ? [{ requestedByUserId: access.id }]
+                        : []),
+                      { requestedByEmail: access.email.toLowerCase() },
+                    ],
+                  }
+                : {}),
+          },
+          _sum: { amount: true },
         }),
       ]);
 
@@ -300,13 +609,13 @@ export class AppService {
         take: dashboardRowLimit,
       });
       const currentBalance =
-        latestWithBalance?.runningBalance ??
-        (await this.prisma.walletTransaction
-          .aggregate({
-            where: walletWhereEarly,
-            _sum: { amount: true },
-          })
-          .then((result) => this.round(result._sum.amount ?? 0)));
+        access.role !== 'UFULFILL'
+          ? this.round(
+              (allDepositTotals._sum.amount ?? 0) +
+                (approvedDepositTotals._sum.amount ?? 0) -
+                Math.abs(allSpendTotals._sum.amount ?? 0),
+            )
+          : 0;
 
       debugCounts.orders = Math.max(debugCounts.orders, totalOrders);
       debugCounts.invoices = Math.max(debugCounts.invoices, totalInvoices);
@@ -334,20 +643,29 @@ export class AppService {
           },
         };
       });
-      const productCosts = this.round(costAgg._sum.productCost ?? 0);
-      const shippingCosts = this.round(costAgg._sum.shippingCost ?? 0);
-      const handlingCosts = this.round(costAgg._sum.handlingCost ?? 0);
-      const totalCosts = this.round(invoiceAgg._sum.total ?? 0);
-      const refunds = this.round(invoiceAgg._sum.refunds ?? 0);
-      const otherCosts = this.round(invoiceAgg._sum.otherCost ?? 0);
+      const canSeeCosts = access.role !== 'UFULFILL';
+      const productCosts = canSeeCosts
+        ? this.round(costAgg._sum.productCost ?? 0)
+        : 0;
+      const shippingCosts = canSeeCosts
+        ? this.round(costAgg._sum.shippingCost ?? 0)
+        : 0;
+      const handlingCosts = canSeeCosts
+        ? this.round(costAgg._sum.handlingCost ?? 0)
+        : 0;
+      const totalCosts = canSeeCosts
+        ? this.round(invoiceAgg._sum.total ?? 0)
+        : 0;
+      const refunds = canSeeCosts
+        ? this.round(invoiceAgg._sum.refunds ?? 0)
+        : 0;
+      const otherCosts = canSeeCosts
+        ? this.round(invoiceAgg._sum.otherCost ?? 0)
+        : 0;
       const stockStatus = this.round(
         stockMovements.reduce((total, movement) => {
-          const sign =
-            movement.movementType === 'consumption' ||
-            movement.movementType === 'used'
-              ? -1
-              : 1;
-          if (movement.movementType === 'snapshot') return total;
+          const sign = this.inventoryMovementSign(movement.movementType);
+          if (sign === 0) return total;
           return total + movement.quantity * sign;
         }, 0),
       );
@@ -369,14 +687,14 @@ export class AppService {
         ordersOverTime: this.groupRecordsByDate(
           orders.map((order) => ({ date: order.orderDate })),
         ),
-        costsByDate: this.groupCostByDate(linesWithOrder),
+        costsByDate: canSeeCosts ? this.groupCostByDate(linesWithOrder) : [],
         ordersByStore: this.groupCountByLabel(
           orders.map(
             (order) => storeNameById.get(order.storeId) ?? 'Unknown store',
           ),
         ),
-        costsByStore: this.groupCostByStore(linesWithOrder),
-        costDistribution: [
+        costsByStore: canSeeCosts ? this.groupCostByStore(linesWithOrder) : [],
+        costDistribution: canSeeCosts ? [
           { label: 'Product', total: productCosts },
           { label: 'Shipping', total: shippingCosts },
           { label: 'Handling', total: handlingCosts },
@@ -385,7 +703,7 @@ export class AppService {
             label: 'Other',
             total: Math.abs(otherCosts),
           },
-        ].filter((item) => item.total > 0),
+        ].filter((item) => item.total > 0) : [],
         stockByProduct: this.groupStockByProduct(stockMovements),
         ordersByStatus: [],
         requestsOverview: [],
@@ -416,8 +734,12 @@ export class AppService {
           total: 1,
         })),
         filterOptions: {
-          brands: brands.map((brand) => brand.name),
-          stores: stores.map((store) => store.name),
+          brands: brands
+            .filter((brand) =>
+              allowedStores.some((store) => store.brandId === brand.id),
+            )
+            .map((brand) => brand.name),
+          stores: allowedStores.map((store) => store.name),
           skus: aliases.map((alias) => alias.sku),
           invoices: this.uniqueOptions(
             invoices.map((invoice) => invoice.invoiceReference),
@@ -440,7 +762,7 @@ export class AppService {
             ),
           ].sort(),
         },
-        debugCounts,
+        debugCounts: access.role === 'TANJAI_ADMIN' ? debugCounts : undefined,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -594,12 +916,23 @@ export class AppService {
     ];
   }
 
-  private async getProductsSection(): Promise<DashboardSection> {
+  private async getProductsSection(
+    skuMode: 'with-skus' | 'without-skus' = 'with-skus',
+    storeIds: string[] | null = null,
+    role = 'TANJAI_ADMIN',
+  ): Promise<DashboardSection> {
+    if (skuMode === 'without-skus') {
+      return this.getStockItemsWithoutSkusSection();
+    }
+
     try {
-      return await this.loadProductsSection(true);
+      return await this.loadProductsSection(
+        role !== 'UFULFILL',
+        storeIds,
+      );
     } catch (error) {
       if (this.isMissingProductQuotationColumn(error)) {
-        return this.loadProductsSection(false);
+        return this.loadProductsSection(false, storeIds);
       }
       throw error;
     }
@@ -607,6 +940,7 @@ export class AppService {
 
   private async loadProductsSection(
     includeQuotation: boolean,
+    storeIds: string[] | null = null,
   ): Promise<DashboardSection> {
     const select: Record<string, unknown> = {
       id: true,
@@ -615,28 +949,21 @@ export class AppService {
       weight: true,
       imageUrl: true,
       skuAliases: {
+        ...(storeIds ? { where: { storeId: { in: storeIds } } } : {}),
         select: { sku: true, store: { select: { name: true } } },
         orderBy: { sku: 'asc' },
       },
-      inventoryMovements: {
-        select: {
-          movementDate: true,
-          movementType: true,
-          quantity: true,
-          reference: true,
-          comment: true,
-        },
-        orderBy: [
-          { movementDate: { sort: 'desc' as const, nulls: 'last' as const } },
-          { sourceRow: 'desc' as const },
-        ],
-        take: 300,
-      },
       _count: {
         select: {
-          orderLines: true,
-          stockPurchases: true,
-          inventoryMovements: true,
+          orderLines: storeIds
+            ? { where: { order: { storeId: { in: storeIds } } } }
+            : true,
+          stockPurchases: storeIds
+            ? { where: { id: '__not_accessible__' } }
+            : true,
+          inventoryMovements: storeIds
+            ? { where: { storeId: { in: storeIds } } }
+            : true,
         },
       },
     };
@@ -645,34 +972,32 @@ export class AppService {
       select.quotation = true;
     }
 
-    const [products, movementTotals] = await Promise.all([
-      this.prisma.product.findMany({
-        orderBy: { name: 'asc' },
-        take: 5000,
-        select,
-      }),
-      this.prisma.inventoryMovement.groupBy({
-        by: ['productId', 'movementType'],
-        _sum: { quantity: true },
-        where: { productId: { not: null } },
-      }),
-    ]);
-    const inventoryByProduct = new Map<string, number>();
-    for (const total of movementTotals) {
-      if (!total.productId || total.movementType === 'snapshot') continue;
-      const sign =
-        total.movementType === 'consumption' || total.movementType === 'used'
-          ? -1
-          : 1;
-      inventoryByProduct.set(
-        total.productId,
-        (inventoryByProduct.get(total.productId) ?? 0) +
-          (total._sum.quantity ?? 0) * sign,
-      );
-    }
-    const catalogProducts = products.filter((product) =>
-      this.isCatalogProduct(product, includeQuotation),
-    );
+    const products = await this.prisma.product.findMany({
+      where: storeIds
+        ? {
+            OR: [
+              { skuAliases: { some: { storeId: { in: storeIds } } } },
+              {
+                orderLines: {
+                  some: { order: { storeId: { in: storeIds } } },
+                },
+              },
+              {
+                inventoryMovements: {
+                  some: { storeId: { in: storeIds } },
+                },
+              },
+            ],
+          }
+        : undefined,
+      orderBy: { name: 'asc' },
+      take: 5000,
+      select,
+    });
+    const catalogProducts = products.filter((product) => {
+      if (!this.isCatalogProduct(product, includeQuotation)) return false;
+      return true;
+    });
 
     return {
       title: 'Products',
@@ -684,12 +1009,227 @@ export class AppService {
         { key: 'stockPurchases', label: 'Stock purchases' },
       ],
       rows: catalogProducts.map((product) =>
-        this.productResponseRow(
-          product,
-          includeQuotation,
-          inventoryByProduct.get((product as { id: string }).id) ?? 0,
-        ),
+        this.productResponseRow(product, includeQuotation, 0, true),
       ),
+    };
+  }
+
+  private async getStockItemsWithoutSkusSection(): Promise<DashboardSection> {
+    const items = await this.prisma.inventoryItem.findMany({
+      where: {
+        AND: [
+          { OR: [{ stockSku: null }, { stockSku: '' }] },
+          { links: { none: { productId: { not: null } } } },
+        ],
+      },
+      orderBy: { stockName: 'asc' },
+      take: 5000,
+      select: {
+        id: true,
+        stockName: true,
+        sourceSheet: true,
+        importBatch: { select: { fileName: true } },
+        _count: { select: { links: true } },
+      },
+    });
+
+    return {
+      title: 'Products Without SKUs',
+      columns: [
+        { key: 'name', label: 'Stock item' },
+        { key: 'sourceSheet', label: 'Source sheet' },
+        { key: 'matchedProduct', label: 'Matched product' },
+        { key: 'inventoryLinks', label: 'Links' },
+      ],
+      rows: items.map((item) => {
+        return {
+          id: undefined,
+          inventoryItemId: item.id,
+          name: item.stockName,
+          description: `Unmatched stock item from ${item.importBatch.fileName}`,
+          imageUrl: null,
+          skuAliases: [],
+          stores: [],
+          skus: '-',
+          weight: null,
+          orderLines: 0,
+          stockPurchases: 0,
+          inventoryMovements: 0,
+          currentInventory: 0,
+          quotation: null,
+          sourceSheet: item.sourceSheet ?? '-',
+          matchedProduct: '-',
+          inventoryLinks: item._count.links,
+        };
+      }),
+    };
+  }
+
+  async getDashboardProduct(id: string, access: AuthenticatedUser) {
+    if (!id) {
+      throw new BadRequestException('Product ID is required.');
+    }
+
+    const storeIds = this.accessStoreIds(access);
+    const product = await this.prisma.product.findFirst({
+      where: {
+        id,
+        ...(storeIds
+          ? {
+              OR: [
+                { skuAliases: { some: { storeId: { in: storeIds } } } },
+                {
+                  orderLines: {
+                    some: { order: { storeId: { in: storeIds } } },
+                  },
+                },
+                {
+                  inventoryMovements: {
+                    some: { storeId: { in: storeIds } },
+                  },
+                },
+              ],
+            }
+          : {}),
+      },
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        weight: true,
+        imageUrl: true,
+        quotation: access.role !== 'UFULFILL',
+        skuAliases: {
+          ...(storeIds ? { where: { storeId: { in: storeIds } } } : {}),
+          select: { sku: true, store: { select: { name: true } } },
+          orderBy: { sku: 'asc' },
+        },
+        inventoryMovements: {
+          ...(storeIds ? { where: { storeId: { in: storeIds } } } : {}),
+          select: {
+            movementDate: true,
+            movementType: true,
+            quantity: true,
+            reference: true,
+            comment: true,
+          },
+          orderBy: [
+            { movementDate: { sort: 'desc' as const, nulls: 'last' as const } },
+            { sourceRow: 'desc' as const },
+          ],
+          take: 300,
+        },
+        _count: {
+          select: {
+            orderLines: storeIds
+              ? { where: { order: { storeId: { in: storeIds } } } }
+              : true,
+            stockPurchases: storeIds
+              ? { where: { id: '__not_accessible__' } }
+              : true,
+            inventoryMovements: storeIds
+              ? { where: { storeId: { in: storeIds } } }
+              : true,
+          },
+        },
+      },
+    });
+
+    if (!product) {
+      throw new NotFoundException('Product was not found.');
+    }
+
+    const movementTotals = await this.prisma.inventoryMovement.groupBy({
+      by: ['movementType'],
+      _sum: { quantity: true },
+      where: {
+        productId: id,
+        ...(storeIds ? { storeId: { in: storeIds } } : {}),
+      },
+    });
+    let currentInventory = 0;
+    for (const total of movementTotals) {
+      const sign = this.inventoryMovementSign(total.movementType);
+      if (sign === 0) continue;
+      currentInventory += (total._sum.quantity ?? 0) * sign;
+    }
+
+    return this.productResponseRow(
+      product,
+      access.role !== 'UFULFILL',
+      this.round(currentInventory),
+    );
+  }
+
+  async getDashboardInventoryItem(id: string) {
+    if (!id) {
+      throw new BadRequestException('Inventory item ID is required.');
+    }
+
+    const item = await this.prisma.inventoryItem.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        stockName: true,
+        sourceSheet: true,
+        importBatchId: true,
+        importBatch: { select: { fileName: true } },
+      },
+    });
+
+    if (!item) {
+      throw new NotFoundException('Inventory item was not found.');
+    }
+
+    const movements = await this.prisma.inventoryMovement.findMany({
+      where: {
+        importBatchId: item.importBatchId,
+        stockName: item.stockName,
+      },
+      select: {
+        movementDate: true,
+        movementType: true,
+        quantity: true,
+        reference: true,
+        comment: true,
+      },
+      orderBy: [
+        { movementDate: { sort: 'desc' as const, nulls: 'last' as const } },
+        { sourceRow: 'desc' as const },
+      ],
+      take: 300,
+    });
+
+    return {
+      id: undefined,
+      inventoryItemId: item.id,
+      name: item.stockName,
+      description: `Unmatched stock item from ${item.importBatch.fileName}`,
+      imageUrl: null,
+      skuAliases: [],
+      stores: [],
+      skus: '-',
+      weight: null,
+      orderLines: 0,
+      stockPurchases: 0,
+      inventoryMovements: movements.length,
+      currentInventory: this.round(
+        movements.reduce((total, movement) => {
+          const sign = this.inventoryMovementSign(movement.movementType);
+          if (sign === 0) return total;
+          return total + movement.quantity * sign;
+        }, 0),
+      ),
+      quotation: null,
+      movements: movements.map((movement) => ({
+        date: this.formatDateValue(movement.movementDate),
+        type: this.formatLabel(movement.movementType),
+        movementType: movement.movementType,
+        quantity: movement.quantity,
+        reference: movement.reference ?? '-',
+        comment: movement.comment ?? '',
+      })),
+      sourceSheet: item.sourceSheet ?? '-',
     };
   }
 
@@ -697,6 +1237,7 @@ export class AppService {
     product: any,
     includeQuotation: boolean,
     currentInventory = 0,
+    compactQuotation = false,
   ) {
     return {
       id: product.id,
@@ -706,7 +1247,9 @@ export class AppService {
       skuAliases: product.skuAliases.map((alias: any) => alias.sku),
       quotation:
         includeQuotation && 'quotation' in product
-          ? (this.normalizeQuotationForResponse(product.quotation) ?? null)
+          ? compactQuotation
+            ? this.compactQuotationForList(product.quotation)
+            : (this.normalizeQuotationForResponse(product.quotation) ?? null)
           : null,
       stores: [
         ...new Set(
@@ -729,6 +1272,33 @@ export class AppService {
         reference: movement.reference ?? '-',
         comment: movement.comment ?? '',
       })),
+    };
+  }
+
+  private compactQuotationForList(quotation: unknown) {
+    if (
+      !quotation ||
+      typeof quotation !== 'object' ||
+      Array.isArray(quotation)
+    ) {
+      return null;
+    }
+
+    const record = quotation as Record<string, unknown>;
+    const firstRow = Array.isArray(record.quotationRows)
+      ? record.quotationRows.find(
+          (row) => row && typeof row === 'object' && !Array.isArray(row),
+        )
+      : null;
+    const firstRowRecord = (firstRow ?? null) as Record<string, unknown> | null;
+
+    return {
+      productGroup:
+        typeof record.productGroup === 'string' ? record.productGroup : '',
+      quotationRows:
+        typeof firstRowRecord?.sourceRow === 'number'
+          ? [{ sourceRow: firstRowRecord.sourceRow }]
+          : [],
     };
   }
 
@@ -883,13 +1453,19 @@ export class AppService {
 
   private async getOrdersSection(
     filters: DashboardFilters = {},
+    accessibleStoreIds: string[] | null = null,
+    role = 'TANJAI_ADMIN',
   ): Promise<DashboardSection> {
+    const canSeeCosts = role !== 'UFULFILL';
     const dateFilter = this.dateFilter(filters.dateFrom, filters.dateTo);
     const invoiceDateFilter = this.dateFilter(
       filters.invoiceDateFrom,
       filters.invoiceDateTo,
     );
     const where: Prisma.OrderWhereInput = {
+      ...(accessibleStoreIds
+        ? { storeId: { in: accessibleStoreIds } }
+        : {}),
       ...(dateFilter ? { orderDate: dateFilter } : {}),
       ...(filters.orderNumber
         ? {
@@ -922,15 +1498,19 @@ export class AppService {
         select: { id: true, name: true, normalizedName: true },
       });
       const normalizedStore = this.normalizeStoreName(filters.store);
-      const storeIds = stores
+      const requestedStoreIds = stores
         .filter(
           (store) =>
             sameText(store.name, filters.store as string) ||
             store.normalizedName === normalizedStore,
         )
-        .map((store) => store.id);
+        .map((store) => store.id)
+        .filter(
+          (storeId) =>
+            !accessibleStoreIds || accessibleStoreIds.includes(storeId),
+        );
 
-      where.storeId = { in: storeIds };
+      where.storeId = { in: requestedStoreIds };
     }
 
     const orderIdSets: string[][] = [];
@@ -998,7 +1578,7 @@ export class AppService {
     const page =
       Number.isFinite(requestedPage) && requestedPage > 0 ? requestedPage : 1;
     const hasDateFilter = Boolean(dateFilter || invoiceDateFilter);
-    const totalCostPromise = hasDateFilter
+    const totalCostPromise = hasDateFilter && canSeeCosts
       ? this.prisma.orderLine.aggregate({
           where: { order: where },
           _sum: { totalCost: true },
@@ -1050,7 +1630,7 @@ export class AppService {
                   description: true,
                   weight: true,
                   imageUrl: true,
-                  quotation: true,
+                  quotation: canSeeCosts,
                   skuAliases: {
                     select: { sku: true, store: { select: { name: true } } },
                     orderBy: { sku: 'asc' },
@@ -1081,7 +1661,9 @@ export class AppService {
       pageSize,
       meta: {
         hasDateFilter,
-        totalCost: this.round(totalCostAggregate?._sum.totalCost ?? 0),
+        totalCost: canSeeCosts
+          ? this.round(totalCostAggregate?._sum.totalCost ?? 0)
+          : 0,
       },
       columns: [
         { key: 'orderNumber', label: 'Order number' },
@@ -1100,7 +1682,16 @@ export class AppService {
         { key: 'lineType', label: 'Line type' },
         { key: 'sourceSheet', label: 'Source sheet' },
         { key: 'sourceRow', label: 'Source row' },
-      ],
+      ].filter(
+        (column) =>
+          canSeeCosts ||
+          ![
+            'productCost',
+            'shippingCost',
+            'handlingCost',
+            'totalCost',
+          ].includes(column.key),
+      ),
       rows: orders.flatMap((order) => {
         const trackingNumbers =
           order.shipments
@@ -1123,10 +1714,14 @@ export class AppService {
               ...baseRow,
               sku: '-',
               quantity: 0,
-              productCost: 0,
-              shippingCost: 0,
-              handlingCost: 0,
-              totalCost: 0,
+              ...(canSeeCosts
+                ? {
+                    productCost: 0,
+                    shippingCost: 0,
+                    handlingCost: 0,
+                    totalCost: 0,
+                  }
+                : {}),
               lineType: '-',
               sourceSheet: order.sourceSheet,
               sourceRow: order.sourceRow,
@@ -1138,10 +1733,14 @@ export class AppService {
           ...baseRow,
           sku: line.sku,
           quantity: line.quantity,
-          productCost: this.round(line.productCost),
-          shippingCost: this.round(line.shippingCost),
-          handlingCost: this.round(line.handlingCost),
-          totalCost: this.round(line.totalCost),
+          ...(canSeeCosts
+            ? {
+                productCost: this.round(line.productCost),
+                shippingCost: this.round(line.shippingCost),
+                handlingCost: this.round(line.handlingCost),
+                totalCost: this.round(line.totalCost),
+              }
+            : {}),
           lineType: this.formatLabel(line.lineType),
           sourceSheet: line.sourceSheet,
           sourceRow: line.sourceRow,
@@ -1190,158 +1789,11 @@ export class AppService {
     };
   }
 
-  private async getProductMatchingSection(): Promise<DashboardSection> {
-    const links = await this.prisma.inventoryProductLink.findMany({
-      orderBy: [
-        { confirmedByAdmin: 'asc' },
-        { confidence: 'asc' },
-        { createdAt: 'desc' },
-      ],
-      take: 500,
-      select: {
-        id: true,
-        relationType: true,
-        quantityPerProduct: true,
-        confidence: true,
-        confirmedByAdmin: true,
-        inventoryItem: {
-          select: {
-            stockName: true,
-            sourceSheet: true,
-            importBatch: { select: { fileName: true } },
-          },
-        },
-        product: { select: { id: true, name: true } },
-      },
-    });
-
-    return {
-      title: 'Product Matching Review',
-      columns: [
-        { key: 'stockItemName', label: 'Stock item name' },
-        { key: 'suggestedProduct', label: 'Suggested product' },
-        { key: 'relationType', label: 'Relation type' },
-        { key: 'confidenceScore', label: 'Confidence score' },
-        { key: 'quantityPerProduct', label: 'Quantity per product' },
-        { key: 'confirmedByAdmin', label: 'Confirmed' },
-      ],
-      rows: links.map((link) => ({
-        id: link.id,
-        stockItemName: link.inventoryItem.stockName,
-        suggestedProduct: link.product?.name ?? '-',
-        suggestedProductId: link.product?.id ?? null,
-        relationType: link.relationType,
-        confidenceScore: this.round(link.confidence),
-        quantityPerProduct: link.quantityPerProduct,
-        confirmedByAdmin: link.confirmedByAdmin,
-        sourceSheet: link.inventoryItem.sourceSheet ?? '-',
-        importFile: link.inventoryItem.importBatch.fileName,
-      })),
-    };
-  }
-
-  async updateProductMatch(
-    matchId: string,
-    action: 'confirm' | 'reject' | 'edit',
-    data: {
-      productName?: string;
-      relationType?: string;
-      quantityPerProduct?: number;
-    } = {},
-  ) {
-    if (!matchId) {
-      throw new Error('Product match ID is required.');
-    }
-
-    if (action === 'reject') {
-      return this.prisma.inventoryProductLink.update({
-        where: { id: matchId },
-        data: {
-          productId: null,
-          confidence: 0,
-          confirmedByAdmin: false,
-        },
-      });
-    }
-
-    const current = await this.prisma.inventoryProductLink.findUnique({
-      where: { id: matchId },
-      select: {
-        productId: true,
-        relationType: true,
-        quantityPerProduct: true,
-        inventoryItem: {
-          select: {
-            stockName: true,
-            normalizedName: true,
-            sourceSheet: true,
-          },
-        },
-      },
-    });
-    if (!current) {
-      throw new Error('Product match was not found.');
-    }
-
-    const product = data.productName
-      ? await this.prisma.product.findFirst({
-          where: {
-            name: { contains: data.productName, mode: 'insensitive' as const },
-          },
-          select: { id: true },
-        })
-      : current.productId
-        ? { id: current.productId }
-        : null;
-    if (!product) {
-      throw new Error('A matching catalog product is required.');
-    }
-
-    const relationType = this.normalizeRelationType(
-      data.relationType ?? current.relationType,
-    );
-    const quantityPerProduct =
-      Number(data.quantityPerProduct ?? current.quantityPerProduct) || 1;
-
-    await this.prisma.productAlias.upsert({
-      where: { normalizedName: current.inventoryItem.normalizedName },
-      update: {
-        productId: product.id,
-        aliasName: current.inventoryItem.stockName,
-        sourceSheet: current.inventoryItem.sourceSheet,
-        confidence: 1,
-        confirmedByAdmin: true,
-      },
-      create: {
-        productId: product.id,
-        aliasName: current.inventoryItem.stockName,
-        normalizedName: current.inventoryItem.normalizedName,
-        sourceSheet: current.inventoryItem.sourceSheet,
-        confidence: 1,
-        confirmedByAdmin: true,
-      },
-    });
-
-    return this.prisma.inventoryProductLink.update({
-      where: { id: matchId },
-      data: {
-        productId: product.id,
-        relationType,
-        quantityPerProduct,
-        confidence: 1,
-        confirmedByAdmin: true,
-      },
-    });
-  }
-
-  private normalizeRelationType(value: string) {
-    return ['alias', 'variant', 'component'].includes(value)
-      ? value
-      : 'alias';
-  }
-
-  private async getStoresSection(): Promise<DashboardSection> {
+  private async getStoresSection(
+    storeIds: string[] | null = null,
+  ): Promise<DashboardSection> {
     const stores = await this.prisma.store.findMany({
+      where: storeIds ? { id: { in: storeIds } } : undefined,
       orderBy: { name: 'asc' },
       take: 500,
       select: {
@@ -1381,13 +1833,46 @@ export class AppService {
     };
   }
 
-  private async getInvoicesSection(): Promise<DashboardSection> {
+  private async getInvoicesSection(
+    filters: DashboardFilters = {},
+    accessibleStoreIds: string[] | null = null,
+    role = 'TANJAI_ADMIN',
+  ): Promise<DashboardSection> {
+    const canSeeCosts = role !== 'UFULFILL';
+    const invoiceDateFilter = this.dateFilter(
+      filters.invoiceDateFrom,
+      filters.invoiceDateTo,
+    );
+    const where: Prisma.FulfillmentInvoiceWhereInput = {
+      ...(accessibleStoreIds
+        ? { storeId: { in: accessibleStoreIds } }
+        : {}),
+      ...(invoiceDateFilter ? { invoiceDate: invoiceDateFilter } : {}),
+      ...(filters.invoice
+        ? {
+            invoiceReference: {
+              contains: filters.invoice,
+              mode: 'insensitive' as const,
+            },
+          }
+        : {}),
+      ...(filters.store
+        ? {
+            store: {
+              name: {
+                equals: filters.store,
+                mode: 'insensitive' as const,
+              },
+            },
+          }
+        : {}),
+    };
     const invoices = await this.prisma.fulfillmentInvoice.findMany({
+      where,
       orderBy: { createdAt: 'desc' },
       take: 500,
       select: {
         invoiceReference: true,
-        invoiceDate: true,
         subtotal: true,
         refunds: true,
         adjustments: true,
@@ -1402,67 +1887,272 @@ export class AppService {
       columns: [
         { key: 'invoice', label: 'Invoice' },
         { key: 'store', label: 'Store' },
-        { key: 'date', label: 'Date' },
         { key: 'subtotal', label: 'Subtotal' },
         { key: 'refunds', label: 'Refunds' },
         { key: 'otherCost', label: 'Other' },
         { key: 'total', label: 'Total' },
-      ],
+      ].filter(
+        (column) =>
+          canSeeCosts ||
+          !['subtotal', 'refunds', 'otherCost', 'total'].includes(column.key),
+      ),
       rows: invoices.map((invoice) => ({
         invoice: invoice.invoiceReference,
         store: invoice.store.name,
-        date: this.formatDateValue(invoice.invoiceDate),
-        subtotal: this.round(invoice.subtotal),
-        refunds: this.round(invoice.refunds),
-        otherCost: this.round(invoice.otherCost),
-        total: this.round(invoice.total),
+        ...(canSeeCosts
+          ? {
+              subtotal: this.round(invoice.subtotal),
+              refunds: this.round(invoice.refunds),
+              otherCost: this.round(invoice.otherCost),
+              total: this.round(invoice.total),
+            }
+          : {}),
       })),
     };
   }
 
-  private async getPaymentsSection(): Promise<DashboardSection> {
+  private async getPaymentsSection(
+    filters: DashboardFilters = {},
+    access: AuthenticatedUser,
+  ): Promise<DashboardSection> {
+    const accessibleStoreIds = this.accessStoreIds(access);
     const stores = await this.prisma.store.findMany({
-      select: { id: true, name: true },
+      where: accessibleStoreIds
+        ? { id: { in: accessibleStoreIds } }
+        : undefined,
+      select: { id: true, name: true, normalizedName: true },
+      orderBy: { name: 'asc' },
     });
     const storeNameById = new Map(
       stores.map((store) => [store.id, store.name]),
     );
-    const payments = await this.prisma.walletTransaction.findMany({
-      orderBy: { createdAt: 'desc' },
-      take: 500,
-      select: {
-        transactionDate: true,
-        transactionType: true,
-        invoiceReference: true,
-        amount: true,
-        runningBalance: true,
-        storeId: true,
+    const dateFilter = this.dateFilter(filters.dateFrom, filters.dateTo);
+    const dateWhere: Prisma.WalletTransactionWhereInput = {
+      ...(dateFilter ? { transactionDate: dateFilter } : {}),
+    };
+    const invoiceDateFilter: Prisma.StringNullableFilter = {
+      ...(filters.dateFrom ? { gte: filters.dateFrom } : {}),
+      ...(filters.dateTo ? { lte: filters.dateTo } : {}),
+    };
+    const depositWhere: Prisma.WalletTransactionWhereInput = {
+      ...dateWhere,
+      transactionType: { contains: 'deposit', mode: 'insensitive' },
+    };
+    const storeInvoiceWhere: Prisma.WalletTransactionWhereInput = {
+      transactionType: {
+        in: ['store_invoice', 'stock_purchase', 'tax'],
+        mode: 'insensitive',
       },
+      ...(Object.keys(invoiceDateFilter).length
+        ? { invoiceReference: invoiceDateFilter }
+        : {}),
+      ...(accessibleStoreIds
+        ? { storeId: { in: accessibleStoreIds } }
+        : {}),
+    };
+
+    if (filters.store) {
+      const normalizedStore = this.normalizeStoreName(filters.store);
+      const storeIds = stores
+        .filter(
+          (store) =>
+            sameText(store.name, filters.store as string) ||
+            store.normalizedName === normalizedStore,
+        )
+        .map((store) => store.id);
+      storeInvoiceWhere.storeId = { in: storeIds };
+    }
+    const paymentType = filters.paymentType?.trim().toLowerCase();
+    const depositOwnerWhere: Prisma.DepositRequestWhereInput = {
+      status: 'APPROVED',
+      ...(access.role === 'BRAND_OWNER'
+        ? {
+            OR: [
+              ...(access.id ? [{ requestedByUserId: access.id }] : []),
+              { requestedByEmail: access.email.toLowerCase() },
+            ],
+          }
+        : {}),
+    };
+    const filteredDepositRequestWhere: Prisma.DepositRequestWhereInput = {
+      ...depositOwnerWhere,
+      ...(dateFilter ? { transactionDate: dateFilter } : {}),
+      ...(paymentType === 'spent' ? { id: '__not_visible__' } : {}),
+    };
+    const visibleWalletDepositWhere: Prisma.WalletTransactionWhereInput =
+      access.role === 'BRAND_OWNER' ? { id: '__not_visible__' } : depositWhere;
+    const paymentWheres =
+      access.role === 'BRAND_OWNER'
+        ? [storeInvoiceWhere]
+        : paymentType === 'deposit'
+        ? [visibleWalletDepositWhere]
+        : paymentType === 'spent'
+          ? [storeInvoiceWhere]
+          : [visibleWalletDepositWhere, storeInvoiceWhere];
+    const where: Prisma.WalletTransactionWhereInput = {
+      OR: paymentWheres,
+    };
+
+    const [
+      payments,
+      depositTotals,
+      storeInvoiceTotals,
+      totalCount,
+      allDepositTotals,
+      allStoreInvoiceTotals,
+      approvedDeposits,
+      approvedDepositTotals,
+      approvedDepositCount,
+      allApprovedDepositTotals,
+    ] =
+      await Promise.all([
+        this.prisma.walletTransaction.findMany({
+          where,
+          orderBy: [
+            { transactionDate: { sort: 'desc', nulls: 'last' } },
+            { createdAt: 'desc' },
+          ],
+          take: 500,
+          select: {
+            transactionDate: true,
+            transactionType: true,
+            invoiceReference: true,
+            amount: true,
+            runningBalance: true,
+            storeId: true,
+          },
+        }),
+        this.prisma.walletTransaction.aggregate({
+          where: visibleWalletDepositWhere,
+          _sum: { amount: true },
+        }),
+        this.prisma.walletTransaction.aggregate({
+          where: storeInvoiceWhere,
+          _sum: { amount: true },
+        }),
+        this.prisma.walletTransaction.count({ where }),
+        this.prisma.walletTransaction.aggregate({
+          where:
+            access.role === 'BRAND_OWNER'
+              ? { id: '__not_accessible__' }
+              : {
+                  transactionType: {
+                    contains: 'deposit',
+                    mode: 'insensitive',
+                  },
+                },
+          _sum: { amount: true },
+        }),
+        this.prisma.walletTransaction.aggregate({
+          where: {
+            transactionType: {
+              in: ['store_invoice', 'stock_purchase', 'tax'],
+              mode: 'insensitive',
+            },
+            ...(accessibleStoreIds
+              ? { storeId: { in: accessibleStoreIds } }
+              : {}),
+          },
+          _sum: { amount: true },
+        }),
+        this.prisma.depositRequest.findMany({
+          where: filteredDepositRequestWhere,
+          orderBy: [{ transactionDate: 'desc' }, { createdAt: 'desc' }],
+          take: 500,
+          select: {
+            id: true,
+            requestedByEmail: true,
+            transactionDate: true,
+            amount: true,
+            createdAt: true,
+          },
+        }),
+        this.prisma.depositRequest.aggregate({
+          where: filteredDepositRequestWhere,
+          _sum: { amount: true },
+        }),
+        this.prisma.depositRequest.count({
+          where: filteredDepositRequestWhere,
+        }),
+        this.prisma.depositRequest.aggregate({
+          where: depositOwnerWhere,
+          _sum: { amount: true },
+        }),
+      ]);
+
+    const depositTotal =
+      paymentType === 'spent'
+        ? 0
+        : this.round(
+            (depositTotals._sum.amount ?? 0) +
+              (approvedDepositTotals._sum.amount ?? 0),
+          );
+    const storeInvoiceTotal =
+      paymentType === 'deposit'
+        ? 0
+        : this.round(storeInvoiceTotals._sum.amount ?? 0);
+    const netMovement = this.round(depositTotal + storeInvoiceTotal);
+    const allDepositTotal = this.round(
+      (allDepositTotals._sum.amount ?? 0) +
+        (allApprovedDepositTotals._sum.amount ?? 0),
+    );
+    const allStoreInvoiceTotal = this.round(
+      Math.abs(allStoreInvoiceTotals._sum.amount ?? 0),
+    );
+    const remainingBalance = this.round(
+      allDepositTotal - allStoreInvoiceTotal,
+    );
+
+    const paymentRows = payments.map((payment) => {
+      const isDeposit = payment.transactionType
+        .toLowerCase()
+        .includes('deposit');
+      return {
+        sortDate: payment.transactionDate?.getTime() ?? 0,
+        date: isDeposit
+          ? this.formatDateValue(payment.transactionDate)
+          : (payment.invoiceReference ?? '-'),
+        store: payment.storeId
+          ? (storeNameById.get(payment.storeId) ?? '-')
+          : 'Brand owner',
+        type: this.formatLabel(payment.transactionType),
+        amount: this.round(payment.amount),
+        balance:
+          access.role === 'TANJAI_ADMIN' &&
+          typeof payment.runningBalance === 'number'
+            ? this.round(payment.runningBalance)
+            : '-',
+      };
     });
+    const approvedDepositRows = approvedDeposits.map((deposit) => ({
+      sortDate: deposit.transactionDate.getTime(),
+      date: this.formatDateValue(deposit.transactionDate),
+      store: deposit.requestedByEmail,
+      type: 'Deposit',
+      amount: this.round(deposit.amount),
+      balance: '-',
+    }));
 
     return {
-      title: 'Payments',
+      title: 'Deposits & Spending',
       columns: [
         { key: 'date', label: 'Date' },
         { key: 'store', label: 'Store' },
         { key: 'type', label: 'Type' },
-        { key: 'invoice', label: 'Invoice' },
         { key: 'amount', label: 'Amount' },
         { key: 'balance', label: 'Balance' },
       ],
-      rows: payments.map((payment) => ({
-        date: this.formatDateValue(payment.transactionDate),
-        store: payment.storeId
-          ? (storeNameById.get(payment.storeId) ?? '-')
-          : '-',
-        type: this.formatLabel(payment.transactionType),
-        invoice: payment.invoiceReference ?? '-',
-        amount: this.round(payment.amount),
-        balance:
-          typeof payment.runningBalance === 'number'
-            ? this.round(payment.runningBalance)
-            : '-',
-      })),
+      rows: [...paymentRows, ...approvedDepositRows]
+        .sort((first, second) => second.sortDate - first.sortDate)
+        .slice(0, 500)
+        .map(({ sortDate: _sortDate, ...row }) => row),
+      totalRows: totalCount + approvedDepositCount,
+      meta: {
+        remainingBalance,
+        deposits: allDepositTotal,
+        storeInvoices: allStoreInvoiceTotal,
+        netMovement,
+      },
     };
   }
 
@@ -1477,6 +2167,13 @@ export class AppService {
     }, {});
 
     return Object.entries(groups).map(([label, total]) => ({ label, total }));
+  }
+
+  private accessStoreIds(access: AuthenticatedUser): string[] | null {
+    if (access.role !== 'BRAND_OWNER') return null;
+    return [...new Set(access.storeIds.map(String).map((id) => id.trim()))].filter(
+      Boolean,
+    );
   }
 
   private formatLabel(value: string): string {
@@ -1614,17 +2311,14 @@ export class AppService {
   private groupStockByProduct(
     movements: Array<{
       quantity: number;
-      movementType: string;
+      movementType: string | null;
       product: { name: string } | null;
     }>,
   ) {
     const grouped = movements.reduce<Record<string, number>>((totals, item) => {
       const label = item.product?.name ?? 'Unknown product';
-      const sign =
-        item.movementType === 'consumption' || item.movementType === 'used'
-          ? -1
-          : 1;
-      if (item.movementType === 'snapshot') return totals;
+      const sign = this.inventoryMovementSign(item.movementType);
+      if (sign === 0) return totals;
       totals[label] = (totals[label] ?? 0) + item.quantity * sign;
       return totals;
     }, {});
@@ -1633,6 +2327,34 @@ export class AppService {
       .map(([label, total]) => ({ label, total: this.round(total) }))
       .sort((first, second) => second.total - first.total)
       .slice(0, 12);
+  }
+
+  private inventoryMovementSign(type: string | null | undefined) {
+    const normalized = String(type ?? '').trim().toLowerCase();
+    if (!normalized) return 0;
+    if (
+      normalized === 'snapshot' ||
+      normalized === 'left' ||
+      normalized.includes('left')
+    ) {
+      return 0;
+    }
+    if (
+      normalized === 'consumption' ||
+      normalized === 'used' ||
+      normalized.includes('consum')
+    ) {
+      return -1;
+    }
+    if (
+      normalized === 'stock' ||
+      normalized === 'inbound' ||
+      normalized === 'return_to_stock' ||
+      normalized.includes('return')
+    ) {
+      return 1;
+    }
+    return 0;
   }
 
   private round(value: number) {

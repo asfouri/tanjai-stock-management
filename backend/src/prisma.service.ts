@@ -47,6 +47,7 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
   readonly inventoryItem: any;
   readonly inventoryProductLink: any;
   readonly walletTransaction: any;
+  readonly depositRequest: any;
   readonly anomaly: any;
 
   constructor() {
@@ -80,6 +81,8 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
     this.walletTransaction =
       this.client?.walletTransaction ??
       createMissingDelegate('walletTransaction');
+    this.depositRequest =
+      this.client?.depositRequest ?? createMissingDelegate('depositRequest');
     this.anomaly = this.client?.anomaly ?? createMissingDelegate('anomaly');
   }
 

@@ -134,7 +134,7 @@ export function LoginClient({
           action="/api/login"
           method="post"
           onSubmit={(event) => {
-            if (!event.defaultPrevented) return;
+            event.preventDefault();
             void handleLogin();
           }}
         >

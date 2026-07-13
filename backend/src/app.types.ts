@@ -10,6 +10,16 @@ export type ActivityItem = {
   createdAt: string | null;
 };
 
+export type NotificationItem = {
+  id: string;
+  type: 'ORDER' | 'DEPOSIT' | 'IMPORT' | 'ANOMALY' | 'STOCK' | 'PAYMENT';
+  priority: 'HIGH' | 'MEDIUM' | 'LOW';
+  title: string;
+  message: string;
+  createdAt: string;
+  section: 'dashboard' | 'imports' | 'products' | 'orders' | 'payments';
+};
+
 export type AttentionItem = {
   label: string;
   total: number;
@@ -30,6 +40,7 @@ export type DashboardFilters = {
   orderSearch?: string;
   orderSort?: 'asc' | 'desc' | '';
   orderPage?: string;
+  paymentType?: string;
 };
 
 export type DashboardDebugCounts = {

@@ -121,6 +121,7 @@ export type ParsedStockPurchase = SourceRef & {
 
 export type ParsedInventoryMovement = SourceRef & {
   stockName?: string;
+  stockSku?: string;
   productName?: string;
   storeName?: string;
   movementDate?: Date;

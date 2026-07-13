@@ -1,11 +1,14 @@
 import { NestFactory } from '@nestjs/core';
 import compression from 'compression';
+import { json, urlencoded } from 'express';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create(AppModule, { bodyParser: false });
   const allowedOrigins = getAllowedOrigins();
 
+  app.use(json({ limit: '8mb' }));
+  app.use(urlencoded({ extended: true, limit: '8mb' }));
   app.use(compression());
   app.enableCors({
     origin: createCorsOriginHandler(allowedOrigins),
