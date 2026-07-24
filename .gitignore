@@ -35,3 +35,12 @@ yarn-error.log*
 
 # Testing
 coverage/
+
+# Generated Excel import audit output
+/audit-artifacts/
+/AUDIT_REPORT*.md
+/audit-results.json
+/audit-mismatches.csv
+/audit-globalship-results.json
+/audit-globalship-mismatches.csv
+/relationship-map*.md

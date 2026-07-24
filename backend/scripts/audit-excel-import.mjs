@@ -28,10 +28,10 @@ function requireBuiltModule(path) {
 }
 
 const { parseXlsxWorkbook } = await import(
-  `file:///${requireBuiltModule(resolve(backendRoot, 'dist/import/excel-openxml.js')).replace(/\\/g, '/')}`
+  `file:///${requireBuiltModule(resolve(backendRoot, 'dist/modules/imports/utilities/excel-openxml.js')).replace(/\\/g, '/')}`
 );
 const { ExcelImportService } = await import(
-  `file:///${requireBuiltModule(resolve(backendRoot, 'dist/import/excel-import.service.js')).replace(/\\/g, '/')}`
+  `file:///${requireBuiltModule(resolve(backendRoot, 'dist/modules/imports/services/excel-import.service.js')).replace(/\\/g, '/')}`
 );
 
 const workbookBuffer = readFileSync(workbookPath);
@@ -738,7 +738,7 @@ Generated: ${results.generatedAt}
 - Production readiness conclusion: ${readiness(results)}
 - Critical problems found: ${critical.length}
 
-This audit used the real workbook \`${results.workbook.fileName}\` and the application parser compiled from \`backend/src/import\`. It did not write production data.
+This audit used the real workbook \`${results.workbook.fileName}\` and the application parser compiled from \`backend/src/modules/imports\`. It did not write production data.
 
 ## Workbook package inspection
 
@@ -826,8 +826,8 @@ No Prisma confirm/import was executed in this audit because the available enviro
 - \`backend/prisma/schema.prisma\`: \`Order.invoiceReference\` and \`WalletTransaction.invoiceReference\` are strings, not relations to \`FulfillmentInvoice\`. This prevents enforced invoice/payment linkage.
 - \`backend/prisma/schema.prisma\`: \`Product.name\` is globally unique, which can merge unrelated same-name products across files or brands.
 - \`backend/prisma/schema.prisma\`: \`ProductSkuAlias.sku\` is globally unique, which can reject or merge future duplicate SKU values from separate contexts.
-- \`backend/src/import/excel-import.service.ts\`: \`parsePaymentBalance\` stores invoice references but does not validate them against parsed invoices before save.
-- \`backend/src/app.service.ts\`: dashboard sections expose rows and nested product summaries, but invoice/payment relationship display is flat and cannot prove relational integrity.
+- \`backend/src/modules/imports/services/excel-import.service.ts\`: \`parsePaymentBalance\` stores invoice references but does not validate them against parsed invoices before save.
+- \`backend/src/modules/dashboard/services/dashboard.service.ts\`: dashboard sections expose rows and nested product summaries, but invoice/payment relationship display is flat and cannot prove relational integrity.
 
 ## Prioritized fix plan
 

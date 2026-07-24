@@ -1,4 +1,4 @@
-import { LoginClient } from "./LoginClient";
+import { LoginClient } from "@/features/auth/components/LoginClient";
 
 type LoginPageProps = {
   searchParams?: Promise<Record<string, string | string[] | undefined>>;
@@ -11,15 +11,7 @@ function firstParam(value: string | string[] | undefined) {
 export default async function LoginPage({ searchParams }: LoginPageProps) {
   const params = (await searchParams) ?? {};
   const initialEmail = firstParam(params.email).trim();
-  const initialPassword = firstParam(params.password);
   const message = firstParam(params.message);
 
-  return (
-    <LoginClient
-      initialEmail={initialEmail}
-      initialPassword={initialPassword}
-      initialMessage={message}
-      shouldAutoSubmit={Boolean(initialEmail && initialPassword)}
-    />
-  );
+  return <LoginClient initialEmail={initialEmail} initialMessage={message} />;
 }

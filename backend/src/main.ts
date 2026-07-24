@@ -1,13 +1,26 @@
 import { NestFactory } from '@nestjs/core';
 import compression from 'compression';
 import { json, urlencoded } from 'express';
+import type { IncomingMessage } from 'node:http';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bodyParser: false });
   const allowedOrigins = getAllowedOrigins();
 
-  app.use(json({ limit: '8mb' }));
+  app.use(
+    json({
+      limit: '8mb',
+      verify: (request: IncomingMessage & { rawBody?: Buffer }, _response, body) => {
+        if (
+          (request.url ?? '').startsWith('/webhooks/woocommerce/') ||
+          (request.url ?? '').startsWith('/webhooks/17track')
+        ) {
+          request.rawBody = Buffer.from(body);
+        }
+      },
+    }),
+  );
   app.use(urlencoded({ extended: true, limit: '8mb' }));
   app.use(compression());
   app.enableCors({

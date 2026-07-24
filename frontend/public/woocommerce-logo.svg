@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 52" role="img" aria-labelledby="title">
+  <title id="title">WooCommerce</title>
+  <path fill="#96588a" d="M6 2h60a6 6 0 0 1 6 6v27a6 6 0 0 1-6 6H38L27 50l2-9H6a6 6 0 0 1-6-6V8a6 6 0 0 1 6-6Z"/>
+  <path fill="#fff" d="M10 15h5l3 12 4-12h5l4 12 3-12h5l-6 18h-5l-4-11-4 11h-5L10 15Zm31 9c0-5.4 4.2-9.5 9.7-9.5s9.7 4.1 9.7 9.5-4.2 9.5-9.7 9.5S41 29.4 41 24Zm5 0c0 2.8 1.9 4.9 4.7 4.9s4.7-2.1 4.7-4.9-1.9-4.9-4.7-4.9S46 21.2 46 24Z"/>
+</svg>

@@ -12,6 +12,15 @@ npm run prisma:generate
 
 Fill `.env` with the database URL and Supabase credentials required by the API.
 
+### Automatic Excel refresh
+
+When `EXCEL_AUTO_REFRESH=true`, `EXCEL_IMPORT_STORAGE=prisma`, and
+`EXCEL_IMPORT_DIR` points to the synchronized workbook folder, the backend
+checks for stable workbook changes and applies them once every 12 hours by
+default. `EXCEL_MIN_AUTO_REFRESH_INTERVAL_SECONDS=43200` controls that cadence.
+The dashboard's manual **Refresh now** action remains available between
+scheduled refreshes.
+
 ## Development
 
 ```bash
@@ -31,4 +40,4 @@ npm run seed:dev-users
 
 ## Database
 
-Prisma models live in `prisma/schema.prisma`. The SQL bootstrap/update script for the Excel import tables lives in `prisma/excel_import_tables.sql`.
+Prisma models live in `prisma/schema.prisma`. The SQL bootstrap/update script for the Excel import tables lives in `prisma/excel-import-tables.sql`.

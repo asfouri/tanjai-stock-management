@@ -5,7 +5,7 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
-  schemas = ["public", "auth"]
+  schemas  = ["public", "auth"]
 }
 
 model ImportBatch {
@@ -35,7 +35,10 @@ model Brand {
   name      String   @unique
   createdAt DateTime @default(now())
 
-  stores Store[]
+  stores                        Store[]
+  shopifyConnections            ShopifyConnection[]
+  wooCommercePendingConnections WooCommercePendingConnection[]
+  wooCommerceConnections        WooCommerceConnection[]
 
   @@map("excel_brands")
   @@schema("public")
@@ -52,11 +55,14 @@ model Store {
 
   brand Brand @relation(fields: [brandId], references: [id])
 
-  skuAliases          ProductSkuAlias[]
-  orders              Order[]
-  fulfillmentInvoices FulfillmentInvoice[]
-  inventoryMovements  InventoryMovement[]
-  walletTransactions  WalletTransaction[]
+  skuAliases                    ProductSkuAlias[]
+  orders                        Order[]
+  fulfillmentInvoices           FulfillmentInvoice[]
+  inventoryMovements            InventoryMovement[]
+  walletTransactions            WalletTransaction[]
+  shopifyConnection             ShopifyConnection?
+  wooCommercePendingConnections WooCommercePendingConnection[]
+  wooCommerceConnection         WooCommerceConnection?
 
   @@unique([brandId, normalizedName])
   @@index([normalizedName])
@@ -64,14 +70,29 @@ model Store {
   @@schema("public")
 }
 
+model ProductGroup {
+  id             String   @id @default(uuid())
+  name           String   @unique
+  normalizedName String   @unique
+  createdAt      DateTime @default(now())
+
+  products Product[]
+
+  @@map("excel_product_groups")
+  @@schema("public")
+}
+
 model Product {
   id          String   @id @default(uuid())
+  groupId     String?
   name        String
   description String?
   weight      Float?
   quotation   Json?
   imageUrl    String?
   createdAt   DateTime @default(now())
+
+  group ProductGroup? @relation(fields: [groupId], references: [id])
 
   skuAliases         ProductSkuAlias[]
   aliases            ProductAlias[]
@@ -81,6 +102,7 @@ model Product {
   inventoryLinks     InventoryProductLink[]
 
   @@unique([name])
+  @@index([groupId])
   @@map("excel_products")
   @@schema("public")
 }
@@ -121,43 +143,57 @@ model ProductAlias {
 }
 
 model Order {
-  id                  String    @id @default(uuid())
-  importBatchId       String
-  storeId             String
-  externalOrderNumber String
-  orderDate           DateTime?
-  invoiceReference    String
-  country             String?
-  status              String    @default("CONFIRMED")
-  sourceSheet         String
-  sourceRow           Int
-  createdAt           DateTime  @default(now())
+  id                      String    @id @default(uuid())
+  importBatchId           String
+  storeId                 String
+  externalOrderNumber     String
+  orderDate               DateTime?
+  invoiceReference        String
+  country                 String?
+  status                  String    @default("CONFIRMED")
+  sourceSheet             String
+  sourceRow               Int
+  createdAt               DateTime  @default(now())
+  provider                String    @default("EXCEL")
+  wooCommerceConnectionId String?
+  externalOrderId         String?
+  currency                String?
+  orderTotal              Float?
+  externalModifiedAt      DateTime?
+  integrationData         Json?
 
-  importBatch ImportBatch @relation(fields: [importBatchId], references: [id])
-  store       Store       @relation(fields: [storeId], references: [id])
+  importBatch           ImportBatch            @relation(fields: [importBatchId], references: [id])
+  store                 Store                  @relation(fields: [storeId], references: [id])
+  wooCommerceConnection WooCommerceConnection? @relation(fields: [wooCommerceConnectionId], references: [id])
 
   lines     OrderLine[]
   shipments Shipment[]
 
   @@unique([storeId, externalOrderNumber, invoiceReference])
+  @@unique([provider, wooCommerceConnectionId, externalOrderId])
   @@index([externalOrderNumber])
+  @@index([wooCommerceConnectionId])
   @@map("excel_orders")
   @@schema("public")
 }
 
 model OrderLine {
-  id           String @id @default(uuid())
-  orderId      String
-  productId    String?
-  sku          String
-  quantity     Float
-  productCost  Float  @default(0)
-  shippingCost Float  @default(0)
-  handlingCost Float  @default(0)
-  totalCost    Float  @default(0)
-  lineType     String @default("product")
-  sourceSheet  String
-  sourceRow    Int
+  id                  String  @id @default(uuid())
+  orderId             String
+  productId           String?
+  sku                 String
+  quantity            Float
+  productCost         Float   @default(0)
+  shippingCost        Float   @default(0)
+  handlingCost        Float   @default(0)
+  totalCost           Float   @default(0)
+  lineType            String  @default("product")
+  sourceSheet         String
+  sourceRow           Int
+  externalProductId   String?
+  externalVariationId String?
+  unitPrice           Float?
+  integrationData     Json?
 
   order   Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
   product Product? @relation(fields: [productId], references: [id])
@@ -168,17 +204,71 @@ model OrderLine {
 }
 
 model Shipment {
-  id             String @id @default(uuid())
-  orderId        String
-  trackingNumber String
-  sourceSheet    String
-  sourceRow      Int
+  id                             String    @id @default(uuid())
+  publicId                       String    @unique @default(uuid())
+  orderId                        String
+  trackingProvider               String?   @default("17TRACK")
+  trackingNumber                 String
+  normalizedTrackingNumber       String?
+  carrierCode                    Int?
+  carrierName                    String?
+  trackingRegistrationStatus     String    @default("UNREGISTERED")
+  trackingStatus                 String?
+  trackingSubStatus              String?
+  trackingTag                    String?
+  trackingRegisteredAt           DateTime?
+  trackingLastRequestedAt        DateTime?
+  trackingLastWebhookAt          DateTime?
+  trackingLatestEventAt          DateTime?
+  trackingLatestEventDescription String?
+  trackingLatestEventLocation    String?
+  trackingDeliveredAt            DateTime?
+  trackingStoppedAt              DateTime?
+  trackingLastErrorCode          String?
+  trackingLastErrorMessage       String?
+  trackingRawData                Json?
+  sourceSheet                    String
+  sourceRow                      Int
+  createdAt                      DateTime  @default(now())
+  updatedAt                      DateTime  @updatedAt
 
-  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  order          Order                   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  trackingEvents ShipmentTrackingEvent[]
 
   @@unique([orderId, trackingNumber])
+  @@unique([normalizedTrackingNumber, carrierCode])
   @@index([trackingNumber])
+  @@index([normalizedTrackingNumber])
+  @@index([trackingRegistrationStatus])
+  @@index([trackingStatus])
   @@map("excel_shipments")
+  @@schema("public")
+}
+
+model ShipmentTrackingEvent {
+  id                    String    @id @default(uuid())
+  shipmentId            String
+  fingerprint           String
+  eventTime             DateTime?
+  eventTimeUtc          DateTime?
+  description           String?
+  translatedDescription String?
+  location              String?
+  stage                 String?
+  subStatus             String?
+  country               String?
+  state                 String?
+  city                  String?
+  postalCode            String?
+  rawData               Json?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+
+  @@unique([shipmentId, fingerprint])
+  @@index([shipmentId, eventTimeUtc])
+  @@map("shipment_tracking_events")
   @@schema("public")
 }
 
@@ -284,6 +374,7 @@ model InventoryProductLink {
   inventoryItem InventoryItem @relation(fields: [inventoryItemId], references: [id])
   product       Product?      @relation(fields: [productId], references: [id])
 
+  @@index([inventoryItemId])
   @@index([confirmedByAdmin])
   @@index([relationType])
   @@map("excel_inventory_product_links")
@@ -314,27 +405,110 @@ model WalletTransaction {
 }
 
 model DepositRequest {
-  id                 String   @id @default(uuid())
-  requestedByUserId  String?
-  requestedByEmail   String
-  transactionDate    DateTime
-  amount             Float
-  proofFileName      String
-  proofMimeType      String
-  proofData           Bytes
-  status              String   @default("PENDING")
-  reviewedByUserId   String?
-  reviewedByEmail    String?
-  reviewedAt          DateTime?
-  rejectionReason    String?
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
+  id                String    @id @default(uuid())
+  requestedByUserId String?
+  requestedByEmail  String
+  transactionDate   DateTime
+  amount            Float
+  proofFileName     String
+  proofMimeType     String
+  proofData         Bytes
+  status            String    @default("PENDING")
+  reviewedByUserId  String?
+  reviewedByEmail   String?
+  reviewedAt        DateTime?
+  rejectionReason   String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
 
   @@index([requestedByUserId])
   @@index([requestedByEmail])
   @@index([status])
   @@index([transactionDate])
   @@map("deposit_requests")
+  @@schema("public")
+}
+
+model ShopifyConnection {
+  id                   String    @id @default(uuid())
+  brandId              String?
+  internalStoreId      String?   @unique
+  connectedByUserId    String?
+  shopDomain           String?   @unique
+  encryptedAccessToken String?
+  scopes               String
+  status               String    @default("PENDING")
+  oauthStateHash       String?   @unique
+  oauthStateExpiresAt  DateTime?
+  connectedAt          DateTime?
+  lastSyncAt           DateTime?
+  disconnectedAt       DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  brand         Brand?  @relation(fields: [brandId], references: [id])
+  internalStore Store?  @relation(fields: [internalStoreId], references: [id])
+
+  @@index([brandId])
+  @@index([connectedByUserId])
+  @@index([status])
+  @@map("shopify_connections")
+  @@schema("public")
+}
+
+model WooCommercePendingConnection {
+  id              String    @id @default(uuid())
+  publicTokenHash String    @unique
+  userId          String
+  brandId         String
+  internalStoreId String
+  siteUrl         String
+  status          String    @default("PENDING")
+  expiresAt       DateTime
+  consumedAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  brand         Brand @relation(fields: [brandId], references: [id])
+  internalStore Store @relation(fields: [internalStoreId], references: [id])
+
+  @@index([userId])
+  @@index([brandId])
+  @@index([internalStoreId])
+  @@index([status])
+  @@map("woocommerce_pending_connections")
+  @@schema("public")
+}
+
+model WooCommerceConnection {
+  id                      String    @id @default(uuid())
+  publicId                String    @unique @default(uuid())
+  brandId                 String
+  internalStoreId         String    @unique
+  connectedByUserId       String
+  siteUrl                 String    @unique
+  encryptedConsumerKey    String?
+  encryptedConsumerSecret String?
+  keyPermissions          String
+  status                  String    @default("CONNECTED")
+  orderCreatedWebhookId   String?
+  orderUpdatedWebhookId   String?
+  orderDeletedWebhookId   String?
+  encryptedWebhookSecret  String?
+  connectedAt             DateTime  @default(now())
+  lastSyncAt              DateTime?
+  disconnectedAt          DateTime?
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  brand         Brand   @relation(fields: [brandId], references: [id])
+  internalStore Store   @relation(fields: [internalStoreId], references: [id])
+  orders        Order[]
+
+  @@index([brandId])
+  @@index([connectedByUserId])
+  @@index([status])
+  @@map("woocommerce_connections")
   @@schema("public")
 }
 

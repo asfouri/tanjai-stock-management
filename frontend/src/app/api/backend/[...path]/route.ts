@@ -35,6 +35,7 @@ async function proxyRequest(request: Request, context: RouteContext) {
   headers.delete("host");
   headers.delete("content-length");
   headers.delete("cookie");
+  headers.set("x-forwarded-proto", new URL(request.url).protocol.replace(":", ""));
   if (cookieToken && !headers.has("authorization")) {
     headers.set("authorization", `Bearer ${decodeURIComponent(cookieToken)}`);
   }
