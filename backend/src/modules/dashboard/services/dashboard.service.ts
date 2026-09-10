@@ -3219,27 +3219,6 @@ export class DashboardService {
     return normalized;
   }
 
-  private catalogNumber(
-    value: number | string | null | undefined,
-    label: string,
-    mustBePositive = false,
-  ) {
-    const numberValue = Number(value);
-    if (
-      value === null ||
-      value === undefined ||
-      String(value).trim() === '' ||
-      !Number.isFinite(numberValue) ||
-      numberValue < 0 ||
-      (mustBePositive && numberValue <= 0)
-    ) {
-      throw new BadRequestException(
-        `${label} must be ${mustBePositive ? 'greater than zero' : 'zero or greater'}.`,
-      );
-    }
-    return numberValue;
-  }
-
   private catalogSkuAssignments(
     input: {
       skuAssignments?: string;

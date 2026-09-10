@@ -20,10 +20,6 @@ export function setCachedAccessToken(token: string | undefined) {
   cachedAccessToken = token ?? "";
 }
 
-export function hasCachedAccessToken() {
-  return Boolean(cachedAccessToken);
-}
-
 export async function getSessionWithTimeout(
   timeoutMs = 1500,
 ): Promise<SessionResponse | null> {

@@ -8,6 +8,9 @@ dist/
 build/
 .next/
 out/
+*.tsbuildinfo
+.cache/
+.turbo/
 
 # Environment
 .env
@@ -19,14 +22,19 @@ out/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+.eslintcache
 
 # OS / editor
 .DS_Store
+Thumbs.db
+Desktop.ini
 *.pem
 .idea/
 .vscode/*
 !.vscode/extensions.json
 .claude/
+*.swp
+*.tmp
 
 # Local Excel workbooks used for manual import checks
 *.xlsx
@@ -35,6 +43,10 @@ yarn-error.log*
 
 # Testing
 coverage/
+.nyc_output/
+
+# Hosting tools
+.vercel/
 
 # Generated Excel import audit output
 /audit-artifacts/
